@@ -136,7 +136,7 @@ class MonitorWindow(QMainWindow):
 
         connection = QHBoxLayout()
         connection.addWidget(QLabel("监听地址"))
-        self.host_edit = QLineEdit("0.0.0.0")
+        self.host_edit = QLineEdit("10.126.104.83")
         self.host_edit.setMaximumWidth(150)
         connection.addWidget(self.host_edit)
         connection.addWidget(QLabel("端口"))
