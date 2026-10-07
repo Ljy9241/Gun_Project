@@ -47,8 +47,8 @@ inline constexpr char WIFI_PASSWORD[] = "zxcvbnm1";
 inline constexpr char UPPER_COMPUTER_HOST[] = "10.126.104.83";
 inline constexpr uint16_t UPPER_COMPUTER_PORT = 8888;
 inline constexpr char DEVICE_ID[] = "gun_dection";
-inline constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
-inline constexpr uint32_t UDP_STATUS_INTERVAL_MS = 5000;
+inline constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;      //Wi-Fi 重新连接的时间间隔
+inline constexpr uint32_t UDP_STATUS_INTERVAL_MS = 50;          // UDP 状态包发送的时间间隔
 
 // 串口诊断信息的输出周期。
 inline constexpr uint32_t DIAGNOSTIC_INTERVAL_MS = 500;
