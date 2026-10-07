@@ -8,6 +8,7 @@
 #include "voice_detection.h"
 #include "wifi_transport.h"
 
+// 各功能模块由主循环协同调度，传感器模块自身不创建任务。
 VoiceDetection voiceDetection;
 VibrateDetection vibrateDetection;
 GpsManager gps(Serial1);
@@ -17,6 +18,7 @@ WifiTransport wifiTransport;
 uint32_t lastDiagnosticMs = 0;
 
 static void printShot(const ShotEvent& shot) {
+    // 输出融合事件摘要，便于不连接上位机时通过串口检查检测结果。
     Serial.printf("SHOT #%lu voice[p2p=%u rms=%.1f] vibration[peak=%.1f jerk=%.1f sat=%s] ",
                   static_cast<unsigned long>(shot.shotCount), shot.voice.peakToPeak,
                   shot.voice.rms, shot.vibration.peakMagnitude, shot.vibration.peakJerk,
@@ -47,6 +49,7 @@ void setup() {
 }
 
 void loop() {
+    // 统一使用微秒时钟驱动传感器采样和事件融合，毫秒时钟用于联网周期任务。
     const uint64_t nowUs = esp_timer_get_time();
     const uint32_t nowMs = millis();
 
@@ -77,6 +80,7 @@ void loop() {
         wifiTransport.enqueue(shot);
     }
 
+    // 汇总最新传感器状态；WifiTransport 会在自己的周期内打包上报。
     WifiTelemetry telemetry;
     telemetry.micRaw = voiceDetection.latestRaw();
     telemetry.micPeakToPeak = voiceDetection.latestPeakToPeak();
@@ -105,6 +109,7 @@ void loop() {
     wifiTransport.setTelemetry(telemetry);
     wifiTransport.update(nowMs);
 
+    // 定期输出健康状态和丢样/发送计数，便于现场排查。
     if (nowMs - lastDiagnosticMs >= config::DIAGNOSTIC_INTERVAL_MS) {
         lastDiagnosticMs = nowMs;
         Serial.printf(

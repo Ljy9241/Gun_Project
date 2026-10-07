@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 
+// 振动触发事件，记录触发时三轴 ADC 值和本次冲击的峰值特征。
 struct VibrateEvent {
     uint64_t timestampUs = 0;
     uint16_t rawX = 0;
@@ -14,9 +15,10 @@ struct VibrateEvent {
 
 class VibrateDetection {
 public:
+    // 配置三轴 ADC 输入和传感器休眠控制脚。
     void begin(uint8_t xPin, uint8_t yPin, uint8_t zPin, uint8_t sleepPin);
     void update(uint64_t nowUs);
-    bool consumeEvent(VibrateEvent& event);
+    bool consumeEvent(VibrateEvent& event);  // 取走单个待处理事件。
 
     bool flag() const { return eventPending_; }
     bool calibrated() const { return calibrated_; }

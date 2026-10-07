@@ -18,6 +18,7 @@ void WifiTransport::begin() {
 
 void WifiTransport::setTelemetry(const WifiTelemetry& telemetry) {
     telemetry_ = telemetry;
+    // 在状态包间隔内累计峰值；成功发送后才清零，发送失败则保留供下次上报。
     windowMicPeakToPeak_ = max(windowMicPeakToPeak_, telemetry.micPeakToPeak);
     windowMicRms_ = max(windowMicRms_, telemetry.micRms);
     windowVibrationMagnitude_ = max(windowVibrationMagnitude_, telemetry.vibrationMagnitude);
@@ -41,6 +42,7 @@ void WifiTransport::update(uint32_t nowMs) {
         }
     }
 
+    // 未连接时按间隔重连；连接恢复后再发送队列和周期状态。
     if (!isConnected) {
         if (nowMs - lastConnectAttemptMs_ >= config::WIFI_RECONNECT_INTERVAL_MS) {
             lastConnectAttemptMs_ = nowMs;
@@ -67,6 +69,7 @@ void WifiTransport::update(uint32_t nowMs) {
 }
 
 bool WifiTransport::sendStatus(uint32_t nowMs) {
+    // 状态包使用 JSON，字段结构与 data_show/gun_wifi_monitor.py 的解析保持一致。
     char payload[768];
     const String localIp = WiFi.localIP().toString();
     const int length = snprintf(
@@ -141,6 +144,7 @@ bool WifiTransport::enqueue(const ShotEvent& event) {
                       static_cast<unsigned long>(droppedEvents_));
         return false;
     }
+    // 环形队列满时丢弃新事件；否则按 FIFO 顺序等待网络发送。
     queue_[head_] = event;
     head_ = (head_ + 1) % QUEUE_SIZE;
     ++count_;
@@ -149,6 +153,7 @@ bool WifiTransport::enqueue(const ShotEvent& event) {
 }
 
 bool WifiTransport::send(const ShotEvent& event) {
+    // 射击包保留事件发生时的传感器特征和定位信息，便于上位机记录。
     char payload[512];
     const int length = snprintf(
         payload, sizeof(payload),

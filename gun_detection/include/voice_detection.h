@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 
+// 声音触发事件：包含峰峰值、均方根幅值和相对背景的突增比例。
 struct VoiceEvent {
     uint64_t timestampUs = 0;
     uint16_t peakToPeak = 0;
@@ -11,6 +12,7 @@ struct VoiceEvent {
 
 class VoiceDetection {
 public:
+    // 初始化麦克风 ADC 与固定采样节拍。
     void begin(uint8_t adcPin);
     void update(uint64_t nowUs);
     bool consumeEvent(VoiceEvent& event);
@@ -22,7 +24,9 @@ public:
     uint32_t droppedSamples() const { return droppedSamples_; }
 
 private:
+    // 清空当前采样帧累积值；每帧完成后重新开始统计。
     void resetFrame();
+    // 根据当前帧的统计特征判断是否产生声音事件。
     void finishFrame(uint64_t nowUs);
 
     uint8_t adcPin_ = 0;

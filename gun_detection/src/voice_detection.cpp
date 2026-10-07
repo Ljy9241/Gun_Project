@@ -14,6 +14,7 @@ void VoiceDetection::begin(uint8_t adcPin) {
 }
 
 void VoiceDetection::resetFrame() {
+    // 帧统计只保留当前窗口的极值、和与平方和。
     sampleCount_ = 0;
     minValue_ = 4095;
     maxValue_ = 0;
@@ -33,6 +34,7 @@ void VoiceDetection::update(uint64_t nowUs) {
     }
     nextSampleUs_ += sampleIntervalUs_;
 
+    // 每次调用至多进行一次 ADC 采样，保证实际采样间隔可控。
     const uint16_t raw = analogRead(adcPin_);
     latestRaw_ = raw;
     minValue_ = min(minValue_, raw);
@@ -48,6 +50,7 @@ void VoiceDetection::update(uint64_t nowUs) {
 }
 
 void VoiceDetection::finishFrame(uint64_t nowUs) {
+    // 由平方均值减均值平方求方差，RMS 表示交流分量强度。
     const float mean = static_cast<float>(sum_) / sampleCount_;
     float variance = static_cast<float>(squareSum_) / sampleCount_ - mean * mean;
     if (variance < 0.0F) {
@@ -58,6 +61,7 @@ void VoiceDetection::finishFrame(uint64_t nowUs) {
     latestRms_ = sqrtf(variance);
     const float riseRatio = latestRms_ / max(previousRms_, 1.0F);
 
+    // 同时要求声音幅度足够大、相对背景突然增强，并满足重触发间隔。
     const bool levelHigh = latestPeakToPeak_ >= config::VOICE_P2P_THRESHOLD &&
                            latestRms_ >= config::VOICE_RMS_THRESHOLD;
     const bool impulsive = riseRatio >= config::VOICE_RISE_RATIO;

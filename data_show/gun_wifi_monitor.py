@@ -1,4 +1,4 @@
-"""UDP/JSON monitor for the ESP32-S3 gun-detection firmware."""
+"""ESP32-S3 检测设备的 UDP/JSON 上位机：实时显示遥测数据并支持 CSV 导出。"""
 
 import csv
 import json
@@ -29,6 +29,7 @@ from PyQt5.QtWidgets import (
 )
 
 
+# 曲线显示最近一段时间的数据；定时器只负责刷新界面，不参与网络接收。
 HISTORY_SECONDS = 60
 UI_REFRESH_MS = 100
 CSV_FIELDS = [
@@ -40,6 +41,7 @@ CSV_FIELDS = [
 
 
 class UdpReceiver(QObject):
+    """在后台线程接收 UDP 数据，并通过 Qt 信号安全地交给界面线程。"""
     packet_received = pyqtSignal(dict)
     receiver_error = pyqtSignal(str)
     listening = pyqtSignal(bool, str)
@@ -51,6 +53,7 @@ class UdpReceiver(QObject):
         self._socket = None
 
     def start(self, host, port):
+        """停止旧监听后，以指定地址和端口启动新的后台接收线程。"""
         self.stop()
         self._stop.clear()
         self._thread = threading.Thread(
@@ -59,6 +62,7 @@ class UdpReceiver(QObject):
         self._thread.start()
 
     def stop(self):
+        """设置停止标志并关闭套接字，以唤醒阻塞中的 recvfrom。"""
         self._stop.set()
         if self._socket:
             try:
@@ -68,6 +72,7 @@ class UdpReceiver(QObject):
             self._socket = None
 
     def _receive_loop(self, host, port):
+        """绑定 UDP 端口、解析 JSON 包，并报告非法数据或套接字错误。"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket = sock
         try:
@@ -105,6 +110,7 @@ class UdpReceiver(QObject):
 
 
 class MonitorWindow(QMainWindow):
+    """主窗口：呈现状态摘要、实时曲线、最近事件并导出历史数据。"""
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Gun Detection WiFi Monitor")
@@ -124,6 +130,7 @@ class MonitorWindow(QMainWindow):
         self.timer.start(UI_REFRESH_MS)
 
     def _build_ui(self):
+        """创建连接控制栏、状态卡片和传感器曲线。"""
         root = QWidget()
         main = QVBoxLayout(root)
 
@@ -199,6 +206,7 @@ class MonitorWindow(QMainWindow):
         self.setCentralWidget(root)
 
     def toggle_listening(self):
+        """根据当前接收线程状态开始或停止监听。"""
         if self.receiver._thread and self.receiver._thread.is_alive() and not self.receiver._stop.is_set():
             self.receiver.stop()
             self.start_button.setText("开始监听")
@@ -210,6 +218,7 @@ class MonitorWindow(QMainWindow):
         self.start_button.setText("停止监听" if active else "开始监听")
 
     def on_packet(self, packet):
+        """记录收到数据的时间，并按协议类型分发状态包或射击事件包。"""
         self.last_packet_time = time.time()
         kind = packet.get("type", "?")
         self.values["last_seen"].setText(
@@ -222,12 +231,14 @@ class MonitorWindow(QMainWindow):
 
     @staticmethod
     def number(value, digits=1):
+        """将数值格式化为指定精度；缺失或非法值显示为占位符。"""
         try:
             return f"{float(value):.{digits}f}"
         except (TypeError, ValueError):
             return "—"
 
     def handle_status(self, packet):
+        """更新实时状态卡片，并将状态样本存入曲线缓存和 CSV 缓存。"""
         mic = packet.get("mic") or {}
         vibration = packet.get("vibration") or {}
         gps = packet.get("gps") or {}
@@ -239,6 +250,7 @@ class MonitorWindow(QMainWindow):
             uptime = time.monotonic() * 1000
         if self.start_uptime is None:
             self.start_uptime = uptime
+        # 以设备运行时间为横轴，避免电脑本地时钟变化影响曲线连续性。
         elapsed = max(0.0, (uptime - self.start_uptime) / 1000.0)
 
         row = {
@@ -291,6 +303,7 @@ class MonitorWindow(QMainWindow):
             self.accel_plot.setXRange(left, max(HISTORY_SECONDS, elapsed), padding=0)
 
     def handle_shot(self, packet):
+        """更新射击计数和最近一次融合事件摘要。"""
         shot_id = packet.get("shotId", "?")
         self.shot_count = int(packet.get("shotCount", self.shot_count + 1) or 0)
         self.values["shots"].setText(str(self.shot_count))
@@ -302,6 +315,7 @@ class MonitorWindow(QMainWindow):
         )
 
     def refresh_display(self):
+        """由 Qt 定时器批量刷新曲线，并提示数据流中断。"""
         if not self.samples:
             return
         rows = list(self.samples)
@@ -317,12 +331,14 @@ class MonitorWindow(QMainWindow):
 
     @staticmethod
     def as_float(value):
+        """将曲线字段转换为浮点数，缺失值按零显示。"""
         try:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
 
     def clear_history(self):
+        """清空本地缓存、重置时间原点并清除所有曲线。"""
         self.samples.clear()
         self.x_values.clear()
         self.start_uptime = None
@@ -330,6 +346,7 @@ class MonitorWindow(QMainWindow):
             curve.clear()
 
     def export_csv(self):
+        """将已缓存的状态包样本导出为带 BOM 的 UTF-8 CSV 文件。"""
         if not self.samples:
             QMessageBox.information(self, "没有数据", "收到状态数据后才能导出 CSV。")
             return
@@ -347,14 +364,17 @@ class MonitorWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", str(exc))
 
     def show_error(self, message):
+        """在窗口连接状态栏显示接收线程错误。"""
         self.connection_label.setText(message)
 
     def closeEvent(self, event):
+        """关闭窗口前停止后台接收，避免线程遗留。"""
         self.receiver.stop()
         event.accept()
 
 
 def main():
+    """创建 Qt 应用并进入桌面事件循环。"""
     app = QApplication(sys.argv)
     window = MonitorWindow()
     window.show()

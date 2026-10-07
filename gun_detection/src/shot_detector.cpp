@@ -15,6 +15,7 @@ void ShotDetector::onVibrateEvent(const VibrateEvent& event) {
 }
 
 void ShotDetector::update(uint64_t nowUs) {
+    // 丢弃过期的单传感器候选，避免将相隔很久的响声和振动误合并。
     if (voiceValid_ && nowUs - voiceEvent_.timestampUs > config::FUSION_WINDOW_US) {
         voiceValid_ = false;
     }
@@ -28,6 +29,7 @@ void ShotDetector::tryFuse(uint64_t nowUs) {
         return;
     }
 
+    // 使用绝对时间差，不依赖声音或振动哪一个先到达。
     const uint64_t difference = voiceEvent_.timestampUs > vibrationEvent_.timestampUs
                                     ? voiceEvent_.timestampUs - vibrationEvent_.timestampUs
                                     : vibrationEvent_.timestampUs - voiceEvent_.timestampUs;
@@ -53,6 +55,7 @@ bool ShotDetector::consumeShot(ShotEvent& event, const GpsFix& gpsFix) {
     if (!shotPending_) {
         return false;
     }
+    // 定位在主循环取事件时附加，使事件尽可能携带最新定位快照。
     pendingShot_.gps = gpsFix;
     event = pendingShot_;
     shotPending_ = false;

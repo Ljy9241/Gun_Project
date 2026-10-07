@@ -11,7 +11,7 @@ void VibrateDetection::begin(uint8_t xPin, uint8_t yPin, uint8_t zPin, uint8_t s
     sleepPin_ = sleepPin;
 
     pinMode(sleepPin_, OUTPUT);
-    digitalWrite(sleepPin_, HIGH);
+    digitalWrite(sleepPin_, HIGH);  // 拉高唤醒 MMA7361。
     pinMode(xPin_, INPUT);
     pinMode(yPin_, INPUT);
     pinMode(zPin_, INPUT);
@@ -28,6 +28,7 @@ void VibrateDetection::update(uint64_t nowUs) {
         return;
     }
 
+    // 若循环严重延迟，跳过错过的采样点，不在同一时刻突发补采。
     if (nowUs - nextSampleUs_ > sampleIntervalUs_ * 4ULL) {
         droppedSamples_ += static_cast<uint32_t>((nowUs - nextSampleUs_) / sampleIntervalUs_);
         nextSampleUs_ = nowUs;
@@ -38,6 +39,7 @@ void VibrateDetection::update(uint64_t nowUs) {
     rawY_ = analogRead(yPin_);
     rawZ_ = analogRead(zPin_);
 
+    // 上电初期取静止样本均值作为重力与安装方向的基线。
     if (!calibrated_) {
         calibrationSumX_ += rawX_;
         calibrationSumY_ += rawY_;
@@ -52,6 +54,7 @@ void VibrateDetection::update(uint64_t nowUs) {
         return;
     }
 
+    // 去除各轴静态基线后计算三维偏移幅值，并用相邻幅值差近似冲击变化率。
     const float dx = rawX_ - baselineX_;
     const float dy = rawY_ - baselineY_;
     const float dz = rawZ_ - baselineZ_;
@@ -59,6 +62,7 @@ void VibrateDetection::update(uint64_t nowUs) {
     jerk_ = fabsf(magnitude_ - previousMagnitude_);
     previousMagnitude_ = magnitude_;
 
+    // 用幅值和尖锐变化共同筛选冲击，并要求连续样本确认以降低孤立噪声误报。
     const bool magnitudeHigh = magnitude_ >= config::VIBRATE_PEAK_THRESHOLD_COUNTS;
     const bool startsWithSharpEdge = jerk_ >= config::VIBRATE_JERK_THRESHOLD_COUNTS;
     const bool saturatedNow = rawX_ < 16 || rawX_ > 4079 || rawY_ < 16 || rawY_ > 4079 ||

@@ -6,6 +6,7 @@
 
 #include "shot_detector.h"
 
+// 定时状态包所需的传感器快照和运行统计。
 struct WifiTelemetry {
     uint16_t micRaw = 0;
     uint16_t micPeakToPeak = 0;
@@ -35,6 +36,7 @@ struct WifiTelemetry {
 
 class WifiTransport {
 public:
+    // 建立 Wi-Fi 站点连接；网络不可用时由 update 周期重试。
     void begin();
     void setTelemetry(const WifiTelemetry& telemetry);
     void update(uint32_t nowMs);
@@ -50,12 +52,14 @@ public:
 
 private:
     static constexpr uint8_t QUEUE_SIZE = 16;
+    // 发送队列中的射击事件；失败时保留队首等待后续重试。
     bool send(const ShotEvent& event);
+    // 上报周期状态包及最近一个统计窗口的传感器峰值。
     bool sendStatus(uint32_t nowMs);
 
     WiFiUDP udp_;
     ShotEvent queue_[QUEUE_SIZE];
-    uint8_t head_ = 0;
+    uint8_t head_ = 0;  // 下一个写入位置。
     uint8_t tail_ = 0;
     uint8_t count_ = 0;
     uint32_t lastConnectAttemptMs_ = 0;
