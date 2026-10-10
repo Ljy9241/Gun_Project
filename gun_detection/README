@@ -1,40 +1,241 @@
-# ESP32-S3 gun detection firmware
+# ESP32-S3 声音与振动检测系统
 
-First functional version: all sensing circuits, the ESP32-S3, GPS and Wi-Fi remain active.
-No light/deep-sleep logic is enabled yet.
+本文介绍 `gun_detection` 固件、传感器接线、检测与事件融合流程，以及 `data_show/gun_wifi_monitor.py` 上位机的构建、运行和通信方法。项目当前实现的是持续采样、声音与振动双条件融合、GPS 信息关联和 UDP 遥测；没有启用灯光或深度睡眠控制。
 
-## Pin assignment
+## 1. 系统组成
 
-| Function | GPIO |
-|---|---:|
-| Microphone ADC | 8 |
-| MMA7361 X/Y/Z | 4 / 5 / 6 |
-| MMA7361 SLEEP | 7 (HIGH = active) |
-| GPS EN / PPS | 9 / 10 |
-| ESP32 UART TX / RX | 17 / 18 |
+系统由 ESP32-S3、麦克风模拟输入、MMA7361 三轴加速度传感器、GPS 模块和运行 PyQt 上位机的电脑组成。固件持续采集声音和三轴加速度数据；只有声音事件和振动事件在规定时间内匹配时，才生成一次融合事件。融合事件可通过串口查看，也可经 Wi-Fi/UDP 发送到上位机。
 
-## Modules
+## 1.1 从开机到上位机的一次完整过程
 
-- `voice_detection`: continuous 8 kHz sampling, 10 ms frame P2P/RMS/energy-rise detection.
-- `vibrate_detection`: 1 kHz three-axis sampling, baseline, magnitude and jerk detection.
-- `shot_detector`: time-window fusion and duplicate-shot suppression.
-- `gps_manager`: continuous NMEA parsing through UART1.
-- `wifi_transport`: non-blocking connection management and UDP/JSON event queue.
+可以把程序理解为一条连续的数据流水线：
 
-## Configuration
+```text
+开机初始化
+  -> 麦克风每 125 微秒采一个 ADC 点，累计成 10 毫秒声音帧
+  -> 加速度计每 1 毫秒读取 X/Y/Z，先校准静态基线，再检测冲击
+  -> 两个检测器各自产生带时间戳的候选事件
+  -> 主循环把候选交给融合器，匹配成功后生成一个 ShotEvent
+  -> 给事件附上当前 GPS 快照，同时输出串口日志
+  -> 如果 Wi-Fi 已配置，将事件放入发送队列并通过 UDP 发出 JSON
+  -> 电脑后台线程收包、解析 JSON，通过 Qt 信号交给窗口线程
+  -> 窗口更新状态卡片和曲线，并把状态样本暂存在内存以便导出 CSV
+```
 
-Edit `include/system_config.h` before hardware/network testing:
+关键点是“采样、判断、融合、传输”是分层完成的。声音检测器不需要知道 GPS 或 Wi-Fi；网络发送失败也不会阻塞 ADC 检测流程。各模块通过 `VoiceEvent`、`VibrateEvent`、`ShotEvent` 和 `WifiTelemetry` 这些结构体交换数据，这样可以分别调整检测算法、通信格式和界面。
 
-- Calibrate the voice and vibration thresholds from serial output.
-- Set `WIFI_SSID`, `WIFI_PASSWORD`, `UPPER_COMPUTER_HOST` and port.
-- Verify the GPS baud rate and that its EN pin is active HIGH.
+## 1.2 为什么采用主循环轮询和模块分层
 
-With Wi-Fi settings left empty, upload is disabled but detection, GPS and serial diagnostics continue.
+`main.cpp` 的 `loop()` 每轮读取微秒时间 `esp_timer_get_time()` 和毫秒时间 `millis()`，依次调用两个传感器的 `update()`、GPS `update()`、事件消费/融合、遥测更新和 Wi-Fi `update()`。模块用 `nextSampleUs_` 判断采样时间是否到达，因此主循环不用等待传感器采样时刻，可以持续处理其他工作。
 
-## Build
+采样不是由硬件定时器或中断完成，而是由主循环按时间戳轮询。这样实现简单，也避免在中断里调用 ADC、浮点计算、串口或网络代码；代价是 Wi-Fi、串口等工作会造成采样时间抖动。若主循环落后超过 4 个采样间隔，当前实现会记录估算的丢样数并跳到当前时间，不会连续补采过期样本。补采无法还原真实波形，反而会把多个读数挤在很短时间内，因此丢弃过期点更诚实。若后续需要严格采样间隔，应考虑硬件定时器/I2S/ADC 连续采样等方案。
+
+主要目录和文件：
+
+| 路径 | 用途 |
+| --- | --- |
+| `src/main.cpp` | 初始化硬件与各模块，调度采样、融合、遥测和串口诊断 |
+| `src/voice_detection.cpp` | 麦克风 ADC 采样、帧统计和声音触发判断 |
+| `src/vibrate_detection.cpp` | MMA7361 校准、三轴振动特征计算和触发判断 |
+| `src/shot_detector.cpp` | 在时间窗内融合声音与振动事件，并抑制重复事件 |
+| `src/gps_manager.cpp` | 读取 GPS UART 数据并生成定位快照 |
+| `src/wifi_transport.cpp` | Wi-Fi 重连、UDP 状态/事件 JSON 发送和事件队列管理 |
+| `include/system_config.h` | 引脚、阈值、网络参数和周期配置 |
+| `include/*.h` | 各模块的接口与事件数据结构 |
+| `platformio.ini` | PlatformIO 的板卡、框架、编译选项和依赖配置 |
+| `../data_show/gun_wifi_monitor.py` | PC 端 UDP 实时监控和 CSV 导出程序 |
+
+## 2. 硬件连接
+
+当前引脚配置见 `include/system_config.h`：
+
+| 信号 | ESP32-S3 GPIO | 说明 |
+| --- | ---: | --- |
+| 麦克风模拟输出 | 8 | ADC 输入，固件使用 12 位 ADC 分辨率 |
+| MMA7361 X | 4 | X 轴模拟输出 |
+| MMA7361 Y | 5 | Y 轴模拟输出 |
+| MMA7361 Z | 6 | Z 轴模拟输出 |
+| MMA7361 SLEEP | 7 | 固件输出高电平以唤醒传感器；低电平为休眠 |
+| GPS EN | 9 | 固件按高电平使能 GPS 模块 |
+| GPS PPS | 10 | GPS PPS 输入，目前固件仅配置引脚，没有使用 PPS 对时 |
+| ESP32-S3 UART TX | 17 | 接 GPS RX |
+| ESP32-S3 UART RX | 18 | 接 GPS TX |
+
+GPS 默认波特率为 9600，串口监视器波特率为 115200。接线前应确认模块供电电压、共地、引脚电平兼容性及 GPS EN 的实际有效电平。MMA7361 的 G-SELECT 在当前 PCB 上拉高，配置按 +/-6 g 量程编写。
+
+## 3. 检测与融合逻辑
+
+### 3.1 声音检测
+
+`VoiceDetection` 按 8 kHz 采样，每 80 个样本形成一帧，帧长约 10 ms。每帧计算 ADC 峰峰值（P2P）和去除直流分量后的 RMS，并比较当前 RMS 与慢速背景参考值，得到声音突增比例。
+
+当前默认触发条件同时要求：
+
+- P2P 不低于 600 ADC 计数；
+- RMS 不低于 100；
+- RMS 相对背景的上升比例不低于 1.5；
+- 距离上次声音触发至少 50 ms。
+
+这些值是初始参数，实际阈值需根据麦克风、电路增益、安装位置和现场噪声调整。每次 `update()` 最多读取一个样本；主循环延迟导致错过采样节拍时，固件记录丢样数并跳过过时采样，不会突发补读。
+
+帧内的 RMS 实际按“标准差”形式计算：先求 ADC 均值 `mean`，再求 `sqrt(平均(raw²) - mean²)`。麦克风模拟输出通常带有直流偏置，所以这个计算关注的是信号围绕本帧均值的变化，而不是 ADC 直流电平。P2P 是帧内最大值减最小值，反映瞬时跨度；RMS 反映整帧能量。两者一起使用，是为了同时排除“偶然一个尖峰”和“幅度不够的背景波动”。
+
+`riseRatio = 当前帧 RMS / previousRms` 用来描述声音相对近期背景是否突然变强。背景值初始为 1，只有当 `levelHigh` 不成立时才按 `0.85 * 旧值 + 0.15 * 当前 RMS` 缓慢更新。这样背景能逐渐跟随环境噪声变化，但高幅度候选不会立刻把参考值抬高，导致突发信号被当成新背景。50 ms 重触发间隔用于避免一次持续声音在相邻帧上重复产生大量事件。
+
+帧结束时才做一次触发判断，因此声音事件时间戳近似是该 10 ms 帧结束时的时间，而不是声波到达的精确瞬间。`eventPending_` 暂存结果，主循环随即调用 `consumeEvent()` 取走它。
+
+### 3.2 振动检测
+
+`VibrateDetection` 按 1 kHz 读取 X/Y/Z 三轴 ADC。启动后前 300 个样本用于估算静止基线；校准完成后，计算三轴相对基线偏移的合成幅值 `magnitude`，并以相邻样本幅值差计算 `jerk` 特征。
+
+默认触发逻辑要求幅值至少为 300，且候选冲击开始时变化量至少为 150；随后需要达到连续触发样本数（默认 2）才生成事件。触发有 50 ms 重触发间隔。传感器安静时（幅值低于 90），基线会缓慢自适应；冲击期间不更新基线。若 ADC 接近量程上下限，事件的 `saturated` 会标记为真。
+
+启动后的 300 个样本约为 300 ms。固件对每个轴分别求均值作为 `baselineX/Y/Z`；校准期应让传感器保持静止，否则初始运动也会被吸收到基线。之后计算：
+
+```text
+dx = rawX - baselineX       magnitude = sqrt(dx² + dy² + dz²)
+dy = rawY - baselineY       jerk      = abs(magnitude - 上一个 magnitude)
+dz = rawZ - baselineZ
+```
+
+三轴合成幅值不依赖设备绕哪一个轴振动，比单独看某个轴更适合检测整体冲击。这里的 `magnitude` 和 `jerk` 单位是 ADC 计数及“每个采样点的计数变化”，没有换算成 g 或物理加加速度，因此它们是检测特征，不是校准后的物理测量值。
+
+冲击起始样本必须同时越过幅值和变化量门槛；起始后只要后续样本仍超过幅值门槛，就可以累计连续样本。任意一步不符合条件都会清零候选峰值和连续计数。连续确认能过滤单点 ADC 毛刺；候选峰值则记录这次确认过程里出现的最大幅值和变化量。三轴任一 ADC 小于 16 或大于 4079 时设置饱和标记，提示信号可能碰到 12 位 ADC 量程边缘，测得的峰值可能低估真实冲击。
+
+静止时基线用 `alpha=0.002` 慢速移动，相当于只吸收很小一部分当前读数。这个自适应可以补偿安装角度或偏置的缓慢改变；只在幅值低于安静门槛时更新，避免把冲击本身学成新的零点。
+
+### 3.3 双传感器融合
+
+声音和振动各自先形成带微秒时间戳的候选事件。两事件的时间差不超过 100 ms 时，融合器生成一个 `ShotEvent`，事件时间戳采用两者中较晚的时间。两次融合事件之间至少间隔 150 ms。超过融合窗口的单独候选会被清除，避免把相隔很久的声音和振动配成同一事件。
+
+融合时不会把 GPS 读取放进检测中断或采样过程。主循环消费融合事件时，将当时最新的 GPS 快照附加到事件；定位无效或数据超过 5 秒时，`gps.valid` 为假。
+
+`ShotDetector` 保存最近一条声音候选和一条振动候选，以及各自是否有效的标志。任一新事件到达都会调用 `tryFuse()`：先检查两个候选都存在、当前没有尚未消费的融合事件，再比较绝对时间差。声音可能先到，也可能振动先到，所以用绝对差而不假设先后顺序。匹配成功后计数递增、复制两个源事件到 `pendingShot_`，并清除两个候选，防止同一候选被重复使用。每轮主循环的 `update()` 会清除超过 100 ms 的孤立候选。
+
+双传感器 AND 融合的理由是：声音能捕捉快速声学脉冲，但敲击、爆音等环境噪声也可能触发；加速度冲击能捕捉设备本体受力，但移动、碰撞也可能触发。要求两者在短时间内共同出现可以减少单一传感器误报。代价是如果某个传感器漏检，另一传感器单独命中不会计为一次射击；100 ms 窗口是对两种信号传播、传感器位置和采
+
+150 ms 冷却时间针对同一次物理事件引起的振铃、机械回弹或连续峰。注意它只在检测候选匹配时检查；若冷却尚未结束，当前候选会等待到过期或被新事件替换，而不是无限期排队。`shotPending_` 则确保主循环先取走一条完整事件，再允许生成下一条待处理融合事件。
+
+### 3.4 为什么 GPS 只在事件生成后附加
+
+GPS 串口数据持续由 `GpsManager::update()` 喂给 TinyGPSPlus 解析。位置、海拔、速度、HDOP、卫星数各自可能有不同更新时间；`currentFix()` 把它们复制到 `GpsFix`，并用位置有效性和位置年龄（不超过 5000 ms）决定 `valid`。GPS 没有参与射击条件，因为定位可能需要数秒才能首次有效，且室内/遮挡环境可能长期无定位；若等待 GPS 才允许检测，会让核心检测失效。事件照常产生，只把最新定位作为附加上下文。
+
+## 4. 固件配置与构建
+
+参数集中放在 `system_config.h` 的 `config` 命名空间中，目的是避免阈值散落在算法函数里。时间使用微秒或毫秒后缀明确单位；声音和振动各自有采样率、触发阈值、重触发间隔，融合器另有融合窗口和事件冷却时间。
+
+### 4.1 配置网络和阈值
+
+编辑 `include/system_config.h`：
+
+- 设置 `WIFI_SSID` 和 `WIFI_PASSWORD`；
+- 将 `UPPER_COMPUTER_HOST` 设置为运行上位机电脑的无线网卡 IPv4 地址；
+- 确认 `UPPER_COMPUTER_PORT` 与上位机监听端口一致（默认 8888）；
+- 按实际传感器和环境调整声音、振动阈值及采样相关参数；
+- 确认 GPS EN 有效电平、UART 引脚和波特率与实际硬件一致。
+
+请勿把手机热点网关地址当作上位机地址。若将 Wi-Fi SSID 或上位机地址留空，固件会禁用网络上传，但检测和串口诊断仍会运行。修改网络配置后需要重新编译并上传固件。
+
+### 4.2 PlatformIO 环境
+
+`platformio.ini` 使用 `esp32-s3-devkitm-1` 板卡、Arduino 框架和 GNU C++17。项目依赖 TinyGPSPlus；首次构建时 PlatformIO 会安装配置中列出的库。
+
+在 `gun_detection` 目录运行：
 
 ```sh
 pio run
 ```
 
-Serial monitor baud rate: 115200.
+编译并上传：
+
+```sh
+pio run -t upload
+```
+
+如果电脑上连接了多个串口设备，可指定实际端口，例如：
+
+```sh
+pio run -t upload --upload-port COM5
+pio device monitor --port COM5 --baud 115200
+```
+
+串口输出包括 `VOICE TRIGGER`、`VIB TRIGGER`、`SHOT` 事件，以及周期性的传感器状态、GPS 解析计数、Wi-Fi 状态、UDP 成功/失败数和丢样计数。实际串口号以设备管理器或 PlatformIO 识别结果为准。
+
+## 5. PC 上位机
+
+上位机脚本位于项目根目录的 `data_show/gun_wifi_monitor.py`。它使用 Python、PyQt5 和 pyqtgraph。安装依赖示例：
+
+```sh
+python -m pip install PyQt5 pyqtgraph
+```
+
+从项目根目录运行：
+
+```sh
+python data_show/gun_wifi_monitor.py
+```
+
+窗口中填写监听地址和端口后点击“开始监听”。通常建议监听地址填 `0.0.0.0`，表示接收电脑所有网络接口上发往该端口的数据；端口默认 8888。固件目标地址则应填写电脑当前连接 Wi-Fi 的 IPv4 地址。上位机显示设备、Wi-Fi 信号、触发标志、GPS、麦克风和加速度摘要，以及最近一次融合事件；图表绘制 X/Y/Z 三轴原始 ADC 曲线，右上角图例可勾选隐藏或显示各轴。状态样本保存在内存中，点击“导出 CSV”可导出已收到的状态数据，“清空曲线”会清除当前缓存。
+
+Windows 防火墙可能阻止 Python 接收 UDP；如无法收到数据，请确认允许 Python 在当前网络配置文件中接收流量，且固件和电脑连接到同一可互通的网络。路由器的客户端隔离功能也可能阻止设备之间互相通信。
+
+实现上，`UdpReceiver` 在 daemon 后台线程里创建 UDP socket、绑定本地地址并阻塞等待 `recvfrom()`。网络等待如果放在 GUI 主线程，会冻结窗口重绘和按钮响应；因此接收线程通过 `packet_received`、`receiver_error`、`listening` 三个 Qt 信号把结果交回主线程，窗口控件只由 Qt 主线程更新。每个数据报按 UTF-8 JSON 解码，只有 JSON 对象会发给界面，同时记录发送方 IP/端口用于“最近数据”显示。
+
+`MonitorWindow.handle_status()` 负责把状态包字段拆成卡片显示值和一行 CSV 样本。曲线横轴使用设备 `uptimeMs`，并在第一次状态包到达时置零；这样电脑系统时间校准或时区变化不会让曲线倒退。`QTimer` 每 100 ms 批量刷新曲线，不需要每收到一个 UDP 包就立刻重绘。缓存用两个最大长度为 20,000 的双端队列保存样本和横坐标，限制长期运行时的内存增长。CSV 导出的是状态包样本，不是每一个内部 ADC 原始采样点，也不会包含没有收到的 UDP 数据。
+
+图中的 X/Y/Z 曲线来自状态包的 `vibration.x/y/z` 三个字段。右上角的复选框调用各自曲线的 `setVisible()`，只控制绘制显示，不停止采样、不改变设备端检测，也不删除缓存数据。
+
+## 6. UDP JSON 数据格式
+
+固件向 `UPPER_COMPUTER_HOST:UPPER_COMPUTER_PORT` 发送 UTF-8 JSON，每个 UDP 数据报以换行结束。上位机根据顶层 `type` 字段区分状态包和射击事件包。
+
+### 6.1 状态包
+
+顶层字段包括：
+
+| 字段 | 含义 |
+| --- | --- |
+| `type` | 固定为 `status` |
+| `deviceId` | 设备标识 |
+| `uptimeMs` | 固件运行毫秒数 |
+| `localIp`、`rssi` | 设备本地 IP 和 Wi-Fi 信号强度 |
+| `mic` | 麦克风原始值、P2P、RMS 和窗口最大值 |
+| `vibration` | 校准状态、三轴 ADC、幅值、变化量和窗口最大值 |
+| `flags` | 当前声音/振动候选标志 |
+| `shotCount`、`sentShots` | 已检测事件数和已发送事件数 |
+| `udp` | 排队数、发送失败数和队列丢弃数 |
+| `gps` | 定位有效性、坐标、海拔、速度、HDOP、卫星数及解析统计 |
+| `sampleDrops` | 声音和振动采样丢失计数 |
+
+目前 `UDP_STATUS_INTERVAL_MS` 在配置中的值是 **50 ms**。状态包包含名为 `maxP2P5s`、`maxRms5s`、`maxMagnitude5s` 和 `maxJerk5s` 的窗口峰值字段，但实现会在每次成功发送状态包后清零这些峰值。
+
+### 6.2 射击事件包
+
+当 `type` 为 `shot` 时，包中包含 `shotId`、`shotCount`、`uptimeUs`、声音 P2P/RMS/上升比例、触发时三轴 ADC、振动峰值/变化量/饱和标记，以及 GPS 有效性和定位字段。`shotId` 与 `shotCount` 当前按固件运行期递增，重启后会重新计数。
+
+UDP 本身不保证数据必达或按序到达。固件为融合事件保留 16 项待发环形队列；网络未连接时事件可暂存在队列中。队列已满时，新事件会被丢弃并增加 `dropped` 计数。状态包用于查看通信统计和当前运行情况。
+
+`WifiTransport::begin()` 只有在 SSID 和目标主机非空时才启用 Wi-Fi；启用后以 station 模式连接，并打开 Wi-Fi modem sleep。`update()` 不等待连接完成：发现断线时每 10 秒调用一次断开/重连，连接时最多发送一个队首射击事件，再按状态周期发送一个状态包。因此无线重试和 UDP 处理留在主循环的周期调用中，而不是用长时间阻塞等待。UDP 对状态数据使用“定期最新快照”，对重要的融合事件使用 16 项 FIFO 缓冲，两种数据采用不同策略：状态值过旧意义不大，事件则尽量排队等待重发。
+
+射击事件只有在 UDP 成功发送后才从队列移除；失败时保留队首，在下一轮继续尝试。队列满则丢弃新来的事件并计数。UDP 仍无法保证接收方一定收到，即使设备端 `endPacket()` 成功也只表示本机网络栈接受了发送请求，不代表电脑应用已经处理。若需要端到端可靠送达，需要增加确认、重传、去重和持久化机制。
+
+## 7. 常见问题排查
+
+| 现象 | 检查方向 |
+| --- | --- |
+| PlatformIO 找不到设备或上传失败 | 检查 USB 数据线、串口驱动、端口占用和上传端口；必要时按开发板要求进入下载模式 |
+| 一直没有声音触发 | 查看串口 `mic[raw/p2p/rms]`，确认麦克风供电和 ADC 接线，再根据实测数据校准阈值 |
+| 振动状态长期显示 `cal` | 确认三轴 ADC 引脚和传感器供电；校准期间尽量保持设备静止，检查采样丢失是否持续增加 |
+| 有声音/振动触发但没有 `SHOT` | 两类事件必须在 100 ms 融合窗口内；检查阈值、传感器安装和时间戳附近的串口日志 |
+| GPS 无有效定位 | 室外开阔环境等待定位，检查 EN、电源、UART TX/RX 是否交叉连接、波特率以及 GPS 字符/校验和计数 |
+| Wi-Fi 一直搜索 | 检查 SSID/密码、热点兼容性和信号；核对串口显示的连接结果及电脑 IP |
+| 上位机没有数据 | 确认上位机监听端口与固件目标端口相同，固件 HOST 是电脑无线 IPv4 地址，监听地址可用 `0.0.0.0`，并检查防火墙和网络隔离 |
+| 图表曲线不变化 | 先确认收到状态包且状态包中的 X/Y/Z 字段存在；检查图例复选框是否勾选 |
+
+## 8. 当前实现边界
+
+- 阈值是可配置的初始值，不代表已经对特定武器、设备安装或环境完成标定。
+- GPS 位置精度和更新速率由 GPS 模块、天线和接收环境决定；事件附带的是消费事件时的最新快照。
+- UDP 状态/事件传输适合局域网实时监控，不包含加密、认证、可靠重传或持久化队列。
+- 上位机最多保留 20,000 条状态样本；关闭程序或清空历史后，内存中的未导出数据不会保留。
+- 固件当前持续运行检测，没有启用睡眠或节能状态机。
