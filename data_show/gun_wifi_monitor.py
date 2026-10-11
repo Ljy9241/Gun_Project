@@ -48,52 +48,73 @@ CSV_FIELDS = [
 TRACK_MAP_HTML = """<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>html,body,#map{height:100%;margin:0} .leaflet-container{font:13px sans-serif}</style>
+<style>html,body,#map{height:100%;margin:0} #map-error{position:absolute;z-index:1000;top:12px;left:50%;transform:translateX(-50%);padding:8px 12px;background:#fff;border:1px solid #d33;color:#900;display:none}</style>
+<script>window._AMapSecurityConfig={securityJsCode:__AMAP_SECURITY_CODE__};</script>
+<script src="https://webapi.amap.com/loader.js"></script>
 </head><body><div id="map"></div><script>
-const map = L.map('map').setView([31.2304, 121.4737], 12);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom: 19,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-}).addTo(map);
-let routeLayers = [];
-function showTrack(points) {
-  routeLayers.forEach(layer => map.removeLayer(layer));
-  routeLayers = [];
-  if (!points || points.length === 0) return;
-  const segments = [];
-  let segment = [];
-  points.forEach((point, index) => {
-    if (index > 0 && point.uptimeMs - points[index - 1].uptimeMs > 30000) {
-      if (segment.length) segments.push(segment);
-      segment = [];
-    }
-    segment.push([point.lat, point.lon]);
-  });
-  if (segment.length) segments.push(segment);
-  segments.forEach(coords => {
-    if (coords.length > 1) {
-      routeLayers.push(L.polyline(coords, {color:'#1565c0', weight:5, opacity:0.85}).addTo(map));
-    }
-  });
-  const first = points[0], last = points[points.length - 1];
-  const marker = (point, label, color) => {
-    const item = L.circleMarker([point.lat, point.lon], {
-      radius:7, color:color, fillColor:color, fillOpacity:1
-    }).bindPopup(label + '<br>' + (point.timestamp || ('设备运行 ' + point.uptimeMs + ' ms')) +
-      '<br>HDOP: ' + (point.hdop || '未知') + ', 卫星: ' + point.satellites);
-    routeLayers.push(item.addTo(map));
-  };
-  marker(first, '起点', '#2e7d32');
-  if (points.length > 1) marker(last, '终点', '#c62828');
-  if (points.length === 1) {
-    map.setView([first.lat, first.lon], 17);
-  } else {
-    const bounds = L.latLngBounds(points.map(point => [point.lat, point.lon]));
-    map.fitBounds(bounds, {padding:[24,24], maxZoom:18});
-  }
+const mapError = document.createElement('div'); mapError.id='map-error'; document.body.appendChild(mapError);
+let map=null, latestTrackRequest=0;
+function showMapError(message){mapError.textContent=message;mapError.style.display='block';}
+function hideMapError(){mapError.style.display='none';}
+function initTrackMap(){
+  AMapLoader.load({key:__AMAP_KEY__, version:'2.0', plugins:['AMap.ToolBar','AMap.Scale']})
+    .then(function(AMap){
+      map=new AMap.Map('map',{zoom:16,center:[120.2,30.3],viewMode:'2D'});
+      map.addControl(new AMap.ToolBar());
+      map.addControl(new AMap.Scale());
+      map.on('complete',hideMapError);
+      if(window.pendingTrack) showTrack(window.pendingTrack);
+    }).catch(function(error){
+      console.error(error); showMapError('高德地图加载失败：请检查网络、Key 和安全密钥配置。');
+    });
 }
+function convertGpsPoints(points, requestId){
+  const converted=[];
+  function next(start){
+    if(requestId!==latestTrackRequest) return;
+    if(start>=points.length){drawTrack(points,converted);return;}
+    const batch=points.slice(start,start+40);
+    const gps=batch.map(point=>[Number(point.lon),Number(point.lat)]);
+    AMap.convertFrom(gps,'gps',function(status,result){
+      if(status!=='complete'||result.info!=='ok'||!result.locations){
+        showMapError('GPS 坐标转换失败，请检查高德服务权限或网络。');return;
+      }
+      converted.push(...result.locations.map(location=>[location.getLng(),location.getLat()]));
+      next(start+batch.length);
+    });
+  }
+  next(0);
+}
+function drawTrack(points,coords){
+  if(!map) return;
+  hideMapError(); map.clearMap();
+  if(!points||!points.length) return;
+  const overlays=[],segments=[];let segment=[];
+  points.forEach((point,index)=>{
+    if(index>0&&point.uptimeMs-points[index-1].uptimeMs>30000){if(segment.length)segments.push(segment);segment=[];}
+    segment.push(coords[index]);
+  });
+  if(segment.length)segments.push(segment);
+  segments.forEach(path=>{if(path.length>1)overlays.push(new AMap.Polyline({path,strokeColor:'#1565c0',strokeWeight:5,strokeOpacity:0.85}));});
+  const infoWindow=new AMap.InfoWindow({offset:new AMap.Pixel(0,-28)});
+  function addMarker(point,position,label,color){
+    const marker=new AMap.Marker({position,title:label,content:'<div style="width:16px;height:16px;border-radius:50%;background:'+color+';border:2px solid white;box-shadow:0 1px 4px #555"></div>',offset:new AMap.Pixel(-9,-9)});
+    marker.on('click',function(){infoWindow.setContent(label+'<br>'+ (point.timestamp||('设备运行 '+point.uptimeMs+' ms'))+'<br>HDOP: '+(point.hdop||'未知')+', 卫星: '+point.satellites);infoWindow.open(map,position);});
+    overlays.push(marker);
+  }
+  addMarker(points[0],coords[0],'起点','#2e7d32');
+  if(points.length>1)addMarker(points[points.length-1],coords[coords.length-1],'终点','#c62828');
+  map.add(overlays);
+  if(points.length===1)map.setZoomAndCenter(17,coords[0]);else map.setFitView(overlays,false,[30,30,30,30],18);
+}
+function showTrack(points){
+  const requestId=++latestTrackRequest;window.pendingTrack=points||[];
+  if(!map)return;
+  map.clearMap();if(!points||!points.length)return;
+  convertGpsPoints(points,requestId);
+}
+window.initTrackMap=initTrackMap;
+initTrackMap();
 </script></body></html>"""
 
 
@@ -300,7 +321,7 @@ class MonitorWindow(QMainWindow):
         map_layout.addWidget(self.track_info)
         self.map_view = QWebEngineView()
         self.map_view.settings().setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
-        self.map_view.setHtml(TRACK_MAP_HTML)
+        self.map_view.setHtml(self._track_map_html())
         self.map_view.loadFinished.connect(lambda _ok: self.show_selected_track())
         map_layout.addWidget(self.map_view, 1)
         self.pages.addTab(plot_page, "加速度曲线")
@@ -308,6 +329,26 @@ class MonitorWindow(QMainWindow):
         self.refresh_track_sessions()
         main.setContentsMargins(8, 8, 8, 8)
         self.setCentralWidget(root)
+
+    def _track_map_html(self):
+        """读取本地高德密钥配置并填入地图页面，密钥文件不纳入版本控制。"""
+        config_path = Path(__file__).with_name("amap_config.json")
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            api_key = config["key"]
+            security_code = config["securityJsCode"]
+            if not api_key or not security_code:
+                raise ValueError("高德 Key 或安全密钥为空")
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            QMessageBox.warning(
+                self, "高德地图配置缺失",
+                f"无法读取地图密钥配置：{exc}\n请在 data_show/amap_config.json 中设置 key 和 securityJsCode。",
+            )
+            api_key = ""
+            security_code = ""
+        return TRACK_MAP_HTML.replace("__AMAP_KEY__", json.dumps(api_key)).replace(
+            "__AMAP_SECURITY_CODE__", json.dumps(security_code)
+        )
 
     def _init_track_database(self):
         """创建本机轨迹数据库；会话和点均使用唯一键支持安全去重。"""
@@ -501,7 +542,7 @@ class MonitorWindow(QMainWindow):
         return key, points
 
     def show_selected_track(self, *_args):
-        """把所选会话坐标传给 Leaflet，在地图上绘制路线和起终点。"""
+        """把所选会话 GPS 坐标传给高德地图，转换后绘制路线和起终点。"""
         if not hasattr(self, "map_view"):
             return
         key, points = self._selected_track_points()
