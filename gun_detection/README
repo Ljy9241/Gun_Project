@@ -287,7 +287,7 @@ SQLite 数据库位置：
 - Windows：`%USERPROFILE%\.gun_wifi_monitor\tracks.sqlite3`
 - Linux/macOS：`~/.gun_wifi_monitor/tracks.sqlite3`
 
-数据库提交成功后上位机才确认。即使收到重复批次，SQLite 唯一键也不会重复生成轨迹点。地图底图使用高德 JS API，查看底图需要电脑联网。请在 `data_show/amap_config.json` 配置 Web 端(JS API)的 `key` 和 `securityJsCode`；该本地凭证文件已加入 `.gitignore`，不要提交到版本库。GPS 原始 WGS-84 坐标会按高德接口要求分批转换为高德坐标后绘制。离线时可能看不到底图，但已接收的路线仍可在恢复网络后显示。
+数据库提交成功后上位机才确认。即使收到重复批次，SQLite 唯一键也不会重复生成轨迹点。地图底图使用高德 JS API，查看底图需要电脑联网。请在 `data_show/amap_config.json` 配置 Web 端(JS API)的 `key` 和 `securityJsCode`；该本地凭证文件已加入 `.gitignore`，不要提交到版本库。GPS 原始 WGS-84 坐标会按高德接口要求分批转换为高德坐标后绘制。会话列表和轨迹详情统一显示 GPS 时间转换后的电脑本地时间；GPS 时间不可用时，会话列表回退显示电脑收到数据的时间。离线时可能看不到底图，但已接收的路线仍可在恢复网络后显示。
 
 ### 8.5 实际使用步骤
 

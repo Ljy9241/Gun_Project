@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyqtgraph as pg
@@ -496,9 +496,19 @@ class MonitorWindow(QMainWindow):
         self.track_combo.blockSignals(True)
         self.track_combo.clear()
         selected_index = -1
-        for device_id, session_id, count, first_seen, _first_sequence in sessions:
+        for device_id, session_id, count, first_seen, first_sequence in sessions:
+            first_point = self.track_db.execute(
+                """SELECT utc_date, utc_time_ms FROM track_points
+                   WHERE device_id=? AND session_id=? AND sequence=?""",
+                (device_id, session_id, first_sequence),
+            ).fetchone()
+            if first_point and first_point[0]:
+                start_time = self._track_timestamp(first_point[0], first_point[1], 0)
+            else:
+                received = datetime.fromisoformat(first_seen).astimezone()
+                start_time = received.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " 本地时间（电脑接收）"
             self.track_combo.addItem(
-                f"{device_id} · {session_id[:8]} · {count} 点 · {first_seen}",
+                f"{device_id} · {session_id[:8]} · {count} 点 · 起始 {start_time}",
                 (device_id, session_id),
             )
             if (device_id, session_id) == current:
@@ -511,15 +521,19 @@ class MonitorWindow(QMainWindow):
 
     @staticmethod
     def _track_timestamp(utc_date, utc_time_ms, uptime_ms):
-        """优先格式化 GPS UTC 时间；GPS 日期不可用时显示设备运行时间。"""
+        """将 GPS UTC 时间转换为电脑本地时间；日期无效时回退到设备运行时间。"""
         if utc_date:
             date = f"{utc_date:08d}"
             milliseconds = max(0, utc_time_ms)
             hour, milliseconds = divmod(milliseconds, 3_600_000)
             minute, milliseconds = divmod(milliseconds, 60_000)
             second, milliseconds = divmod(milliseconds, 1_000)
-            return (f"{date[:4]}-{date[4:6]}-{date[6:8]} "
-                    f"{hour:02d}:{minute:02d}:{second:02d}.{milliseconds:03d} UTC")
+            gps_utc = datetime.strptime(
+                f"{date} {hour:02d}:{minute:02d}:{second:02d}.{milliseconds:03d}",
+                "%Y%m%d %H:%M:%S.%f",
+            ).replace(tzinfo=timezone.utc)
+            local_time = gps_utc.astimezone()
+            return local_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " 本地时间"
         return f"设备运行 {uptime_ms / 1000:.1f} 秒"
 
     def _selected_track_points(self):
