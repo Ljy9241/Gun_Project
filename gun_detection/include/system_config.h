@@ -18,6 +18,13 @@ inline constexpr uint8_t GPS_UART_RX_PIN = 18;  // ESP32 RX <- GPS TX
 inline constexpr uint32_t SERIAL_BAUD = 115200;
 inline constexpr uint32_t GPS_BAUD = 9600;
 inline constexpr uint32_t GPS_MAX_FIX_AGE_MS = 5000;
+inline constexpr uint32_t TRACK_SAMPLE_INTERVAL_MS = 2000;
+inline constexpr float TRACK_MIN_DISTANCE_M = 3.0F;
+inline constexpr float TRACK_MIN_MOVING_SPEED_KMPH = 1.0F;
+inline constexpr float TRACK_MAX_HDOP = 8.0F;
+inline constexpr uint16_t TRACK_UPLOAD_RETRY_MS = 1000;
+inline constexpr uint8_t TRACK_BATCH_POINTS = 8;
+inline constexpr uint16_t TRACK_ACK_PORT = 8889;
 
 // 声音检测参数：当前为初始值，实际使用前应结合采集数据校准。
 inline constexpr uint32_t VOICE_SAMPLE_RATE_HZ = 8000;

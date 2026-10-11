@@ -16,6 +16,10 @@ void GpsManager::update() {
     // 尽可能清空串口接收缓冲区，避免主循环期间 NMEA 数据积压。
     while (serial_.available() > 0) {
         gps_.encode(static_cast<char>(serial_.read()));
+        // TinyGPSPlus 在经纬度字段提交新值时置位；保存独立标志供轨迹记录器消费。
+        if (gps_.location.isUpdated()) {
+            locationUpdatePending_ = true;
+        }
     }
 }
 
@@ -40,5 +44,20 @@ GpsFix GpsManager::currentFix() {
     if (gps_.satellites.isValid()) {
         fix.satellites = gps_.satellites.value();
     }
+    if (gps_.date.isValid() && gps_.time.isValid()) {
+        fix.utcDate = static_cast<uint32_t>(gps_.date.year()) * 10000UL +
+                      static_cast<uint32_t>(gps_.date.month()) * 100UL + gps_.date.day();
+        fix.utcTimeMs = static_cast<uint32_t>(gps_.time.hour()) * 3600000UL +
+                        static_cast<uint32_t>(gps_.time.minute()) * 60000UL +
+                        static_cast<uint32_t>(gps_.time.second()) * 1000UL +
+                        static_cast<uint32_t>(gps_.time.centisecond()) * 10UL;
+        fix.utcValid = true;
+    }
     return fix;
+}
+
+bool GpsManager::consumeLocationUpdate() {
+    const bool updated = locationUpdatePending_;
+    locationUpdatePending_ = false;
+    return updated;
 }

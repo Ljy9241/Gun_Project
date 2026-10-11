@@ -163,10 +163,10 @@ pio device monitor --port COM5 --baud 115200
 
 ## 5. PC 上位机
 
-上位机脚本位于项目根目录的 `data_show/gun_wifi_monitor.py`。它使用 Python、PyQt5 和 pyqtgraph。安装依赖示例：
+上位机脚本位于项目根目录的 `data_show/gun_wifi_monitor.py`。它使用 Python、PyQt5、PyQtWebEngine 和 pyqtgraph；WebEngine 用于嵌入 Leaflet 地图。安装依赖：
 
 ```sh
-python -m pip install PyQt5 pyqtgraph
+python -m pip install -r data_show/requirements.txt
 ```
 
 从项目根目录运行：
@@ -232,10 +232,78 @@ UDP 本身不保证数据必达或按序到达。固件为融合事件保留 16 
 | 上位机没有数据 | 确认上位机监听端口与固件目标端口相同，固件 HOST 是电脑无线 IPv4 地址，监听地址可用 `0.0.0.0`，并检查防火墙和网络隔离 |
 | 图表曲线不变化 | 先确认收到状态包且状态包中的 X/Y/Z 字段存在；检查图例复选框是否勾选 |
 
-## 8. 当前实现边界
+## 8. GPS 校园轨迹：采集、暂存、补传和地图
+
+这一功能和射击事件检测并行工作。它不等待声音/振动融合，也不要求走动时始终有 Wi-Fi。路线点在设备端先写入 Flash 文件系统；联网后按小批次发送，电脑先提交到 SQLite，再给设备确认。设备只有收到与当前批次匹配的确认，才推进本地上传游标。
+
+### 8.1 设备如何选取轨迹点
+
+GPS 的 NMEA 字节仍由 `GpsManager::update()` 解析。每当 TinyGPSPlus 提交了新的经纬度，GpsManager 将“有新坐标”记为待消费；主循环拿到最新 `GpsFix` 后调用 `GpsTrackStore::recordFix()`。单纯反复读取同一 GPS fix 不会重复记录，因为必须同时满足“坐标确实更新”这一条件。
+
+一条记录只有在以下条件成立时才会保存：
+
+- GPS 坐标有效，且位置年龄不超过 `GPS_MAX_FIX_AGE_MS`（5 秒）；
+- HDOP 未超过 `TRACK_MAX_HDOP`（默认 8）。如果 GPS 没有提供有效 HDOP（值为 0），当前策略允许记录；
+- 与上次记录点的移动距离达到 `TRACK_MIN_DISTANCE_M`（默认 3 米）；若距离还没达到 3 米，只有 GPS 速度不低于 `TRACK_MIN_MOVING_SPEED_KMPH`（默认 1 km/h），且距离上次记录已达到 `TRACK_SAMPLE_INTERVAL_MS`（默认 2 秒）时才补一个点。
+
+距离用 Haversine 球面距离公式从两组经纬度计算。采用“距离或时间”双条件，是为了行走较快时保留空间细节、行走较慢时仍定期记录；过滤高 HDOP 则尽量避免把明显质量差的定位画进路线。该策略没有复杂的地图匹配或跳点预测，建筑反射仍可能造成 GPS 漂移；校园实走后应根据实际密度和定位质量调整这几个参数。
+
+每个点带有随机生成的 `sessionId` 和从 1 开始的 `seq`，用于区分每次开机/记录会话以及会话内点的次序。记录还保存设备运行毫秒数、GPS UTC 日期/当天毫秒数、经纬度、HDOP 和卫星数。若 GPS 日期或时间无效，时间字段写 0，上位机改用设备运行时间显示。
+
+### 8.2 Flash 暂存和断电恢复
+
+当前 `platformio.ini` 的 `huge_app.csv` 分区表预留了 `spiffs` 数据分区（0xE0000 字节，约 896 KiB）；ESP32 Arduino 的 `LittleFS` 以 `spiffs` 作为分区标签挂载。固件首次使用时如果该分区尚未格式化，会初始化一次；NVS 中写入初始化标志。之后若 LittleFS 挂载失败，固件不会自动格式化，以免删除尚未上传的数据。
+
+每个定位点以 CSV 行追加到 `/gps_track.csv` 并立即 flush；它是设备内部日志格式，不是供用户直接打开的导出文件。这样不会把整个行程留在易失 RAM 中，掉电时最多损失正在写入的尾行。开机恢复时，固件检查并丢弃不完整尾行。上传确认游标单独保存在 NVS：重启后从最后确认的位置继续；如果设备已发送但确认没到，数据会重发，电脑用唯一键去重。
+
+当确认游标越过日志前缀后，固件会把尚未确认的尾部整理到临时文件，再替换日志并重置游标，释放已上传数据占用的空间。替换过程保留备份文件；开机时根据主文件/备份文件状态恢复。分区空间有限：存储已初始化但单点追加失败时会增加 `droppedPoints`，不会静默覆盖尚未确认的点。若文件系统初始化/挂载失败，`track.storageReady` 会显示不可用。状态包中的 `track.storageReady`、`track.pendingPoints` 和 `track.droppedPoints` 可用于查看存储状态。
+
+### 8.3 上传协议为什么要确认
+
+轨迹包顶层格式如下：
+
+```json
+{"type":"track_chunk","deviceId":"gun_dection","sessionId":"0123456789abcdef","points":[
+  {"seq":1,"uptimeMs":12000,"utcDate":20261010,"utcTimeMs":37234000,"lat":31.2304000,"lon":121.4738000,"hdop":1.2,"satellites":9}
+]}
+```
+
+每个数据报最多 8 个连续点，远小于 UDP 的理论上限，降低 IP 分片和丢包概率。设备每秒最多重试一次同一批未确认数据。上位机将点按 `(deviceId, sessionId, seq)` 写入 SQLite 主键表；先提交事务，再回一个 `track_ack` JSON，确认其中的会话 ID 和批次最后序号。设备的 UDP socket 固定绑定本地 8889 端口，电脑在收到轨迹包的源 IP/端口上回复；普通状态和射击包仍发往电脑的 UDP 8888 端口。
+
+确认机制处理两种情况：如果电脑已保存但 ACK 丢失，设备重发，同一主键会被忽略后再次 ACK；如果电脑还没提交数据就退出，它不会发送 ACK，设备保留该批并在 Wi-Fi 恢复后重试。它能避免应用层遗漏和重复写入，但 UDP 仍可能暂时不可用；设备 Flash 空间也不是无限的。
+
+### 8.4 上位机地图与本地数据
+
+安装上位机依赖：
+
+```sh
+python -m pip install -r data_show/requirements.txt
+```
+
+打开“GPS 轨迹地图”页并启动 8888 端口监听。地图会列出本机已保存的会话，按 `seq` 顺序绘制折线，绿色为起点、红色为终点；点选起终点可查看时间、HDOP 和卫星数。若相邻点间隔超过 30 秒，地图将其画成分段，避免把长时间无 GPS 的空档误当作已知路径。可通过“导出 GeoJSON”将选中路线保存下来。
+
+SQLite 数据库位置：
+
+- Windows：`%USERPROFILE%\.gun_wifi_monitor\tracks.sqlite3`
+- Linux/macOS：`~/.gun_wifi_monitor/tracks.sqlite3`
+
+数据库提交成功后上位机才确认。即使收到重复批次，SQLite 唯一键也不会重复生成轨迹点。地图底图使用 OpenStreetMap 瓦片，查看底图需要电脑联网；轨迹坐标本身保存在本机数据库中。离线时可能看不到底图，但已接收的路线仍可在恢复网络后显示。
+
+### 8.5 实际使用步骤
+
+1. 检查 `system_config.h` 中的 Wi-Fi 和电脑 IPv4 地址；电脑和设备应在可互通的网络。
+2. 编译并上传固件，打开串口监视器，确认 `GPS track storage ready` 和 `Wi-Fi connected`。若需离线采集，Wi-Fi 未连接不影响 GPS 点写入。
+3. 电脑安装 `data_show/requirements.txt` 中的依赖，运行 `python data_show/gun_wifi_monitor.py`，监听地址建议填 `0.0.0.0`，端口填 8888。
+4. 室外等待 GPS 获得有效定位，观察状态卡片中的 GPS 状态和轨迹缓存信息，再开始行走。首次定位可能需要等待。
+5. 行走期间断网时继续记录；恢复 Wi-Fi 后固件会补传缓存。电脑收到批次后，地图会出现对应的会话和路线。
+6. 选择会话查看路线，必要时导出 GeoJSON 备份。
+
+## 9. 当前实现边界
 
 - 阈值是可配置的初始值，不代表已经对特定武器、设备安装或环境完成标定。
 - GPS 位置精度和更新速率由 GPS 模块、天线和接收环境决定；事件附带的是消费事件时的最新快照。
 - UDP 状态/事件传输适合局域网实时监控，不包含加密、认证、可靠重传或持久化队列。
 - 上位机最多保留 20,000 条状态样本；关闭程序或清空历史后，内存中的未导出数据不会保留。
 - 固件当前持续运行检测，没有启用睡眠或节能状态机。
+- 地图路段精度取决于 GPS 接收质量；建筑物附近可能出现偏移或抖动，当前没有使用校园道路数据进行地图匹配。
+- OpenStreetMap 在线底图需要网络，当前没有预下载校园瓦片的离线地图包。

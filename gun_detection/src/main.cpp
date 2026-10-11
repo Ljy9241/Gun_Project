@@ -2,6 +2,7 @@
 #include <esp_timer.h>
 
 #include "gps_manager.h"
+#include "gps_track_store.h"
 #include "shot_detector.h"
 #include "system_config.h"
 #include "vibrate_detection.h"
@@ -14,6 +15,7 @@ VibrateDetection vibrateDetection;
 GpsManager gps(Serial1);
 ShotDetector shotDetector;
 WifiTransport wifiTransport;
+GpsTrackStore gpsTrackStore;
 
 uint32_t lastDiagnosticMs = 0;
 
@@ -43,6 +45,7 @@ void setup() {
                             config::MMA_SLEEP_PIN);
     gps.begin(config::GPS_ENABLE_PIN, config::GPS_PPS_PIN, config::GPS_UART_RX_PIN,
               config::GPS_UART_TX_PIN, config::GPS_BAUD);
+    gpsTrackStore.begin();
     wifiTransport.begin();
 
     Serial.println("MMA7361 and GPS enabled; continuous detection started.");
@@ -74,6 +77,7 @@ void loop() {
 
     shotDetector.update(nowUs);
     const GpsFix fix = gps.currentFix();
+    gpsTrackStore.recordFix(fix, nowMs, gps.consumeLocationUpdate());
     ShotEvent shot;
     if (shotDetector.consumeShot(shot, fix)) {
         printShot(shot);
@@ -106,15 +110,18 @@ void loop() {
     telemetry.shotCount = shotDetector.shotCount();
     telemetry.voiceDroppedSamples = voiceDetection.droppedSamples();
     telemetry.vibrationDroppedSamples = vibrateDetection.droppedSamples();
+    telemetry.trackStorageReady = gpsTrackStore.ready();
+    telemetry.trackPendingPoints = gpsTrackStore.pendingPoints();
+    telemetry.trackDroppedPoints = gpsTrackStore.droppedPoints();
     wifiTransport.setTelemetry(telemetry);
-    wifiTransport.update(nowMs);
+    wifiTransport.update(nowMs, gpsTrackStore);
 
     // 定期输出健康状态和丢样/发送计数，便于现场排查。
     if (nowMs - lastDiagnosticMs >= config::DIAGNOSTIC_INTERVAL_MS) {
         lastDiagnosticMs = nowMs;
         Serial.printf(
             "mic[raw=%u p2p=%u rms=%.1f] mma[%s x=%u y=%u z=%u mag=%.1f jerk=%.1f] "
-            "flags[%d,%d] gps[%s sats=%lu chars=%lu] wifi[%s] "
+            "flags[%d,%d] gps[%s sats=%lu chars=%lu] track[%s pending=%lu drop=%lu] wifi[%s] "
             "udp[q=%u shot=%lu status=%lu fail=%lu drop=%lu] dropped[%lu,%lu]\n",
             voiceDetection.latestRaw(), voiceDetection.latestPeakToPeak(),
             voiceDetection.latestRms(), vibrateDetection.calibrated() ? "ready" : "cal",
@@ -123,6 +130,9 @@ void loop() {
             shotDetector.flag2(), fix.valid ? "fix" : "search",
             static_cast<unsigned long>(fix.satellites),
             static_cast<unsigned long>(gps.parsedCharacters()),
+            gpsTrackStore.ready() ? "ready" : "off",
+            static_cast<unsigned long>(gpsTrackStore.pendingPoints()),
+            static_cast<unsigned long>(gpsTrackStore.droppedPoints()),
             wifiTransport.connected() ? "connected" : (wifiTransport.enabled() ? "search" : "off"),
             wifiTransport.queuedEvents(),
             static_cast<unsigned long>(wifiTransport.sentEvents()),

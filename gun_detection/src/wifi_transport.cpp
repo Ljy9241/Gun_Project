@@ -1,6 +1,54 @@
 #include "wifi_transport.h"
 
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "system_config.h"
+
+namespace {
+bool jsonStringField(const char* json, const char* key, char* value, size_t capacity) {
+    char token[32];
+    snprintf(token, sizeof(token), "\"%s\"", key);
+    const char* field = strstr(json, token);
+    if (field == nullptr || (field = strchr(field, ':')) == nullptr) {
+        return false;
+    }
+    while (isspace(static_cast<unsigned char>(*++field))) {
+    }
+    if (*field++ != '"') {
+        return false;
+    }
+    size_t length = 0;
+    while (*field != '\0' && *field != '"') {
+        if (length + 1 >= capacity) {
+            return false;
+        }
+        value[length++] = *field++;
+    }
+    if (*field != '"') {
+        return false;
+    }
+    value[length] = '\0';
+    return true;
+}
+
+bool jsonUintField(const char* json, const char* key, uint32_t& value) {
+    char token[32];
+    snprintf(token, sizeof(token), "\"%s\"", key);
+    const char* field = strstr(json, token);
+    if (field == nullptr || (field = strchr(field, ':')) == nullptr) {
+        return false;
+    }
+    char* end = nullptr;
+    const unsigned long parsed = strtoul(field + 1, &end, 10);
+    if (end == field + 1) {
+        return false;
+    }
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+}  // namespace
 
 void WifiTransport::begin() {
     enabled_ = config::WIFI_SSID[0] != '\0' && config::UPPER_COMPUTER_HOST[0] != '\0';
@@ -10,6 +58,10 @@ void WifiTransport::begin() {
     }
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(true);
+    ackPortReady_ = udp_.begin(config::TRACK_ACK_PORT);
+    if (!ackPortReady_) {
+        Serial.printf("UDP local port bind failed: %u\n", config::TRACK_ACK_PORT);
+    }
     WiFi.begin(config::WIFI_SSID, config::WIFI_PASSWORD);
     lastConnectAttemptMs_ = millis();
     Serial.printf("Wi-Fi connecting: ssid=%s, UDP target=%s:%u\n", config::WIFI_SSID,
@@ -25,7 +77,7 @@ void WifiTransport::setTelemetry(const WifiTelemetry& telemetry) {
     windowVibrationJerk_ = max(windowVibrationJerk_, telemetry.vibrationJerk);
 }
 
-void WifiTransport::update(uint32_t nowMs) {
+void WifiTransport::update(uint32_t nowMs, GpsTrackStore& trackStore) {
     if (!enabled_) {
         return;
     }
@@ -52,6 +104,14 @@ void WifiTransport::update(uint32_t nowMs) {
         return;
     }
 
+    if (!ackPortReady_) {
+        ackPortReady_ = udp_.begin(config::TRACK_ACK_PORT);
+    }
+
+    if (ackPortReady_) {
+        receiveTrackAcks(trackStore);
+    }
+
     if (count_ > 0 && send(queue_[tail_])) {
         tail_ = (tail_ + 1) % QUEUE_SIZE;
         --count_;
@@ -66,11 +126,43 @@ void WifiTransport::update(uint32_t nowMs) {
             windowVibrationJerk_ = 0.0F;
         }
     }
+
+    if (ackPortReady_ && nowMs - lastTrackSendMs_ >= config::TRACK_UPLOAD_RETRY_MS) {
+        TrackBatch batch;
+        if (trackStore.peekBatch(batch)) {
+            lastTrackSendMs_ = nowMs;
+            sendTrackBatch(batch);
+        }
+    }
+}
+
+void WifiTransport::receiveTrackAcks(GpsTrackStore& trackStore) {
+    while (udp_.parsePacket() > 0) {
+        char payload[256];
+        const int length = udp_.read(reinterpret_cast<uint8_t*>(payload), sizeof(payload) - 1);
+        if (length <= 0) {
+            continue;
+        }
+        payload[length] = '\0';
+        char type[32];
+        char sessionId[17];
+        uint32_t sequence = 0;
+        if (jsonStringField(payload, "type", type, sizeof(type)) &&
+            strcmp(type, "track_ack") == 0 &&
+            jsonStringField(payload, "sessionId", sessionId, sizeof(sessionId)) &&
+            jsonUintField(payload, "seq", sequence) &&
+            trackStore.acknowledge(sessionId, sequence)) {
+            Serial.printf("GPS track ACK: session=%s seq=%lu pending=%lu\n", sessionId,
+                          static_cast<unsigned long>(sequence),
+                          static_cast<unsigned long>(trackStore.pendingPoints()));
+            lastTrackSendMs_ = 0;
+        }
+    }
 }
 
 bool WifiTransport::sendStatus(uint32_t nowMs) {
     // 状态包使用 JSON，字段结构与 data_show/gun_wifi_monitor.py 的解析保持一致。
-    char payload[768];
+    char payload[1024];
     const String localIp = WiFi.localIP().toString();
     const int length = snprintf(
         payload, sizeof(payload),
@@ -88,7 +180,8 @@ bool WifiTransport::sendStatus(uint32_t nowMs) {
         "\"altitudeM\":%.1f,\"speedKmph\":%.1f,\"hdop\":%.1f,"
         "\"satellites\":%lu,\"ageMs\":%lu,\"chars\":%lu,"
         "\"failedChecksums\":%lu},"
-        "\"sampleDrops\":{\"voice\":%lu,\"vibration\":%lu}}\r\n",
+        "\"sampleDrops\":{\"voice\":%lu,\"vibration\":%lu},"
+        "\"track\":{\"storageReady\":%s,\"pendingPoints\":%lu,\"droppedPoints\":%lu}}\r\n",
         config::DEVICE_ID, static_cast<unsigned long>(nowMs), localIp.c_str(),
         static_cast<long>(WiFi.RSSI()), telemetry_.micRaw, telemetry_.micPeakToPeak,
         telemetry_.micRms, windowMicPeakToPeak_, windowMicRms_,
@@ -109,7 +202,10 @@ bool WifiTransport::sendStatus(uint32_t nowMs) {
         static_cast<unsigned long>(telemetry_.gpsCharacters),
         static_cast<unsigned long>(telemetry_.gpsFailedChecksums),
         static_cast<unsigned long>(telemetry_.voiceDroppedSamples),
-        static_cast<unsigned long>(telemetry_.vibrationDroppedSamples));
+        static_cast<unsigned long>(telemetry_.vibrationDroppedSamples),
+        telemetry_.trackStorageReady ? "true" : "false",
+        static_cast<unsigned long>(telemetry_.trackPendingPoints),
+        static_cast<unsigned long>(telemetry_.trackDroppedPoints));
 
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(payload) ||
         !udp_.beginPacket(config::UPPER_COMPUTER_HOST, config::UPPER_COMPUTER_PORT)) {
@@ -130,6 +226,23 @@ bool WifiTransport::sendStatus(uint32_t nowMs) {
     ++sentStatuses_;
     Serial.printf("UDP STATUS OK -> %s:%u bytes=%d: %s\n",
                   config::UPPER_COMPUTER_HOST, config::UPPER_COMPUTER_PORT, length, payload);
+    return true;
+}
+
+bool WifiTransport::sendTrackBatch(const TrackBatch& batch) {
+    if (batch.length == 0 ||
+        !udp_.beginPacket(config::UPPER_COMPUTER_HOST, config::UPPER_COMPUTER_PORT)) {
+        ++failedSends_;
+        return false;
+    }
+    udp_.write(reinterpret_cast<const uint8_t*>(batch.payload), batch.length);
+    if (udp_.endPacket() != 1) {
+        ++failedSends_;
+        return false;
+    }
+    Serial.printf("GPS track batch sent: session=%s seq=%lu points=%u bytes=%u\n",
+                  batch.sessionId, static_cast<unsigned long>(batch.lastSequence),
+                  batch.pointCount, static_cast<unsigned>(batch.length));
     return true;
 }
 

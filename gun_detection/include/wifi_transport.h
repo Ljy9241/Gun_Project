@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
+#include "gps_track_store.h"
 #include "shot_detector.h"
 
 // 定时状态包所需的传感器快照和运行统计。
@@ -32,6 +33,9 @@ struct WifiTelemetry {
     uint32_t shotCount = 0;
     uint32_t voiceDroppedSamples = 0;
     uint32_t vibrationDroppedSamples = 0;
+    bool trackStorageReady = false;
+    uint32_t trackPendingPoints = 0;
+    uint32_t trackDroppedPoints = 0;
 };
 
 class WifiTransport {
@@ -39,7 +43,7 @@ public:
     // 建立 Wi-Fi 站点连接；网络不可用时由 update 周期重试。
     void begin();
     void setTelemetry(const WifiTelemetry& telemetry);
-    void update(uint32_t nowMs);
+    void update(uint32_t nowMs, GpsTrackStore& trackStore);
     bool enqueue(const ShotEvent& event);
 
     bool enabled() const { return enabled_; }
@@ -54,8 +58,10 @@ private:
     static constexpr uint8_t QUEUE_SIZE = 16;
     // 发送队列中的射击事件；失败时保留队首等待后续重试。
     bool send(const ShotEvent& event);
+    bool sendTrackBatch(const TrackBatch& batch);
     // 上报周期状态包及最近一个统计窗口的传感器峰值。
     bool sendStatus(uint32_t nowMs);
+    void receiveTrackAcks(GpsTrackStore& trackStore);
 
     WiFiUDP udp_;
     ShotEvent queue_[QUEUE_SIZE];
@@ -65,6 +71,7 @@ private:
     uint32_t lastConnectAttemptMs_ = 0;
     uint32_t lastStatusMs_ = 0;
     uint32_t lastSendErrorLogMs_ = 0;
+    uint32_t lastTrackSendMs_ = 0;
     uint32_t sentEvents_ = 0;
     uint32_t sentStatuses_ = 0;
     uint32_t lastShotCount_ = 0;
@@ -77,4 +84,5 @@ private:
     float windowVibrationJerk_ = 0.0F;
     bool enabled_ = false;
     bool wasConnected_ = false;
+    bool ackPortReady_ = false;
 };

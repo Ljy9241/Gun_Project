@@ -13,6 +13,9 @@ struct GpsFix {
     double hdop = 0.0;
     uint32_t satellites = 0;
     uint32_t ageMs = UINT32_MAX;
+    uint32_t utcDate = 0;  // YYYYMMDD，GPS UTC 日期。
+    uint32_t utcTimeMs = 0;  // 当天 UTC 毫秒数。
+    bool utcValid = false;
 };
 
 class GpsManager {
@@ -23,6 +26,7 @@ public:
     void begin(uint8_t enablePin, uint8_t ppsPin, int8_t rxPin, int8_t txPin, uint32_t baud);
     void update();  // 持续读取串口字节并交给 TinyGPSPlus 解析。
     GpsFix currentFix();  // 将解析器中的最新字段整理成快照。
+    bool consumeLocationUpdate();  // 自上次读取后是否解析到新的坐标。
     uint32_t parsedCharacters() const { return gps_.charsProcessed(); }
     uint32_t failedChecksums() const { return gps_.failedChecksum(); }
 
@@ -31,4 +35,5 @@ private:
     TinyGPSPlus gps_;
     uint8_t enablePin_ = 0;
     uint8_t ppsPin_ = 0;
+    bool locationUpdatePending_ = false;
 };

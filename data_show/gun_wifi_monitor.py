@@ -3,17 +3,20 @@
 import csv
 import json
 import socket
+import sqlite3
 import sys
 import threading
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 import pyqtgraph as pg
 from PyQt5.QtCore import QEvent, QObject, QTimer, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -25,9 +28,11 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+from PyQt5.QtWebEngineWidgets import QWebEngineSettings, QWebEngineView
 
 
 # 曲线显示最近一段时间的数据；定时器只负责刷新界面，不参与网络接收。
@@ -39,6 +44,57 @@ CSV_FIELDS = [
     "vibration_z", "vibration_magnitude", "vibration_jerk", "gps_valid",
     "latitude", "longitude", "altitude_m", "speed_kmph", "satellites",
 ]
+
+TRACK_MAP_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>html,body,#map{height:100%;margin:0} .leaflet-container{font:13px sans-serif}</style>
+</head><body><div id="map"></div><script>
+const map = L.map('map').setView([31.2304, 121.4737], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+}).addTo(map);
+let routeLayers = [];
+function showTrack(points) {
+  routeLayers.forEach(layer => map.removeLayer(layer));
+  routeLayers = [];
+  if (!points || points.length === 0) return;
+  const segments = [];
+  let segment = [];
+  points.forEach((point, index) => {
+    if (index > 0 && point.uptimeMs - points[index - 1].uptimeMs > 30000) {
+      if (segment.length) segments.push(segment);
+      segment = [];
+    }
+    segment.push([point.lat, point.lon]);
+  });
+  if (segment.length) segments.push(segment);
+  segments.forEach(coords => {
+    if (coords.length > 1) {
+      routeLayers.push(L.polyline(coords, {color:'#1565c0', weight:5, opacity:0.85}).addTo(map));
+    }
+  });
+  const first = points[0], last = points[points.length - 1];
+  const marker = (point, label, color) => {
+    const item = L.circleMarker([point.lat, point.lon], {
+      radius:7, color:color, fillColor:color, fillOpacity:1
+    }).bindPopup(label + '<br>' + (point.timestamp || ('设备运行 ' + point.uptimeMs + ' ms')) +
+      '<br>HDOP: ' + (point.hdop || '未知') + ', 卫星: ' + point.satellites);
+    routeLayers.push(item.addTo(map));
+  };
+  marker(first, '起点', '#2e7d32');
+  if (points.length > 1) marker(last, '终点', '#c62828');
+  if (points.length === 1) {
+    map.setView([first.lat, first.lon], 17);
+  } else {
+    const bounds = L.latLngBounds(points.map(point => [point.lat, point.lon]));
+    map.fitBounds(bounds, {padding:[24,24], maxZoom:18});
+  }
+}
+</script></body></html>"""
 
 
 class UdpReceiver(QObject):
@@ -94,6 +150,8 @@ class UdpReceiver(QObject):
                     packet = json.loads(data.decode("utf-8-sig").strip())
                     if isinstance(packet, dict):
                         packet["_sender"] = f"{address[0]}:{address[1]}"
+                        packet["_sender_ip"] = address[0]
+                        packet["_sender_port"] = address[1]
                         self.packet_received.emit(packet)
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     self.receiver_error.emit(f"收到非 JSON 数据：{exc}")
@@ -125,6 +183,10 @@ class MonitorWindow(QMainWindow):
         self.start_uptime = None
         self.last_packet_time = None
         self.shot_count = 0
+        self.track_db_path = Path.home() / ".gun_wifi_monitor" / "tracks.sqlite3"
+        self.track_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.track_db = sqlite3.connect(self.track_db_path)
+        self._init_track_database()
         self._build_ui()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_display)
@@ -165,6 +227,7 @@ class MonitorWindow(QMainWindow):
             ("flags", "检测标志"), ("gps", "GPS 状态"),
             ("coordinates", "经纬度"), ("altitude", "海拔"),
             ("speed", "速度"), ("satellites", "卫星数"),
+            ("track", "轨迹缓存"),
             ("mic", "麦克风"), ("accel", "三轴原始值"),
             ("vibration", "振动量 / 变化量"),
             ("last_shot", "最近事件"), ("last_seen", "最近数据"),
@@ -180,9 +243,14 @@ class MonitorWindow(QMainWindow):
             summary.addWidget(box, index // 4, index % 4)
         main.addLayout(summary)
 
+        self.pages = QTabWidget()
+        main.addWidget(self.pages, 1)
+
+        plot_page = QWidget()
+        plot_layout = QVBoxLayout(plot_page)
         self.plot_widget = pg.GraphicsLayoutWidget()
         self.plot_widget.setBackground("w")
-        main.addWidget(self.plot_widget, 1)
+        plot_layout.addWidget(self.plot_widget)
         self.accel_plot = self.plot_widget.addPlot(row=0, col=0, title="三轴加速度原始 ADC 值")
         self.accel_plot.setLabel("bottom", "时间", units="s")
         self.accel_plot.showGrid(x=True, y=True, alpha=0.25)
@@ -213,8 +281,54 @@ class MonitorWindow(QMainWindow):
         self.legend_panel = legend_panel
         self.plot_widget.viewport().installEventFilter(self)
         self._position_legend()
+
+        map_page = QWidget()
+        map_layout = QVBoxLayout(map_page)
+        map_controls = QHBoxLayout()
+        map_controls.addWidget(QLabel("已保存轨迹"))
+        self.track_combo = QComboBox()
+        self.track_combo.currentIndexChanged.connect(self.show_selected_track)
+        map_controls.addWidget(self.track_combo, 1)
+        refresh_tracks_button = QPushButton("刷新列表")
+        refresh_tracks_button.clicked.connect(self.refresh_track_sessions)
+        map_controls.addWidget(refresh_tracks_button)
+        export_track_button = QPushButton("导出 GeoJSON")
+        export_track_button.clicked.connect(self.export_selected_track)
+        map_controls.addWidget(export_track_button)
+        map_layout.addLayout(map_controls)
+        self.track_info = QLabel("轨迹数据保存在本机用户目录。地图底图需要网络连接。")
+        map_layout.addWidget(self.track_info)
+        self.map_view = QWebEngineView()
+        self.map_view.settings().setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+        self.map_view.setHtml(TRACK_MAP_HTML)
+        self.map_view.loadFinished.connect(lambda _ok: self.show_selected_track())
+        map_layout.addWidget(self.map_view, 1)
+        self.pages.addTab(plot_page, "加速度曲线")
+        self.pages.addTab(map_page, "GPS 轨迹地图")
+        self.refresh_track_sessions()
         main.setContentsMargins(8, 8, 8, 8)
         self.setCentralWidget(root)
+
+    def _init_track_database(self):
+        """创建本机轨迹数据库；会话和点均使用唯一键支持安全去重。"""
+        self.track_db.execute("PRAGMA journal_mode=WAL")
+        self.track_db.execute(
+            """CREATE TABLE IF NOT EXISTS track_points (
+                device_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                uptime_ms INTEGER NOT NULL,
+                utc_date INTEGER NOT NULL,
+                utc_time_ms INTEGER NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                hdop REAL NOT NULL,
+                satellites INTEGER NOT NULL,
+                received_at TEXT NOT NULL,
+                PRIMARY KEY (device_id, session_id, sequence)
+            )"""
+        )
+        self.track_db.commit()
 
     def _position_legend(self):
         """将轴颜色图例固定在绘图区域右上角。"""
@@ -260,6 +374,179 @@ class MonitorWindow(QMainWindow):
             self.handle_status(packet)
         elif kind == "shot":
             self.handle_shot(packet)
+        elif kind == "track_chunk":
+            self.handle_track_chunk(packet)
+
+    def handle_track_chunk(self, packet):
+        """先持久化一批轨迹点，再回 ACK；未提交的数据不会确认给设备。"""
+        device_id = str(packet.get("deviceId", ""))
+        session_id = str(packet.get("sessionId", ""))
+        points = packet.get("points")
+        if not device_id or not session_id or not isinstance(points, list) or not points:
+            self.show_error("收到格式无效的轨迹数据")
+            return
+
+        received_at = datetime.now().isoformat(timespec="milliseconds")
+        rows = []
+        previous_sequence = None
+        try:
+            for point in points:
+                sequence = int(point["seq"])
+                latitude = float(point["lat"])
+                longitude = float(point["lon"])
+                if not -90 <= latitude <= 90:
+                    raise ValueError("纬度超出范围")
+                if not -180 <= longitude <= 180 or sequence <= 0:
+                    raise ValueError("经度或序号超出范围")
+                if previous_sequence is not None and sequence != previous_sequence + 1:
+                    raise ValueError("批次内轨迹序号不连续")
+                previous_sequence = sequence
+                rows.append((
+                    device_id, session_id, sequence, int(point.get("uptimeMs", 0)),
+                    int(point.get("utcDate", 0)), int(point.get("utcTimeMs", 0)),
+                    latitude, longitude, float(point.get("hdop", 0.0)),
+                    int(point.get("satellites", 0)), received_at,
+                ))
+            self.track_db.executemany(
+                """INSERT OR IGNORE INTO track_points
+                   (device_id, session_id, sequence, uptime_ms, utc_date, utc_time_ms,
+                    latitude, longitude, hdop, satellites, received_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+            self.track_db.commit()
+        except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+            self.track_db.rollback()
+            self.show_error(f"轨迹保存失败，设备会稍后重传：{exc}")
+            return
+
+        self._send_track_ack(packet, session_id, previous_sequence)
+        self.refresh_track_sessions((device_id, session_id))
+        self.track_info.setText(
+            f"已接收并保存 {len(rows)} 个轨迹点；数据库：{self.track_db_path}"
+        )
+
+    def _send_track_ack(self, packet, session_id, sequence):
+        """将数据库提交后的确认发回设备 UDP 源地址和端口。"""
+        host = packet.get("_sender_ip")
+        port = packet.get("_sender_port")
+        if not host or not port:
+            return
+        payload = json.dumps({
+            "type": "track_ack", "sessionId": session_id, "seq": sequence,
+        }, separators=(",", ":")).encode("utf-8")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as ack_socket:
+                ack_socket.sendto(payload, (host, int(port)))
+        except OSError as exc:
+            self.show_error(f"轨迹已保存，但确认包发送失败：{exc}")
+
+    def refresh_track_sessions(self, preferred=None):
+        """刷新本机保存的轨迹会话列表，并尽量保留当前选择。"""
+        if not hasattr(self, "track_combo"):
+            return
+        current = preferred or self.track_combo.currentData()
+        sessions = self.track_db.execute(
+            """SELECT device_id, session_id, COUNT(*), MIN(received_at), MIN(sequence)
+               FROM track_points
+               GROUP BY device_id, session_id
+               ORDER BY MIN(received_at) DESC"""
+        ).fetchall()
+        self.track_combo.blockSignals(True)
+        self.track_combo.clear()
+        selected_index = -1
+        for device_id, session_id, count, first_seen, _first_sequence in sessions:
+            self.track_combo.addItem(
+                f"{device_id} · {session_id[:8]} · {count} 点 · {first_seen}",
+                (device_id, session_id),
+            )
+            if (device_id, session_id) == current:
+                selected_index = self.track_combo.count() - 1
+        if selected_index < 0 and self.track_combo.count():
+            selected_index = 0
+        self.track_combo.setCurrentIndex(selected_index)
+        self.track_combo.blockSignals(False)
+        self.show_selected_track()
+
+    @staticmethod
+    def _track_timestamp(utc_date, utc_time_ms, uptime_ms):
+        """优先格式化 GPS UTC 时间；GPS 日期不可用时显示设备运行时间。"""
+        if utc_date:
+            date = f"{utc_date:08d}"
+            milliseconds = max(0, utc_time_ms)
+            hour, milliseconds = divmod(milliseconds, 3_600_000)
+            minute, milliseconds = divmod(milliseconds, 60_000)
+            second, milliseconds = divmod(milliseconds, 1_000)
+            return (f"{date[:4]}-{date[4:6]}-{date[6:8]} "
+                    f"{hour:02d}:{minute:02d}:{second:02d}.{milliseconds:03d} UTC")
+        return f"设备运行 {uptime_ms / 1000:.1f} 秒"
+
+    def _selected_track_points(self):
+        key = self.track_combo.currentData()
+        if not key:
+            return None, []
+        device_id, session_id = key
+        rows = self.track_db.execute(
+            """SELECT sequence, uptime_ms, utc_date, utc_time_ms, latitude, longitude,
+                      hdop, satellites
+               FROM track_points
+               WHERE device_id=? AND session_id=? ORDER BY sequence""",
+            (device_id, session_id),
+        ).fetchall()
+        points = [{
+            "seq": row[0], "uptimeMs": row[1],
+            "timestamp": self._track_timestamp(row[2], row[3], row[1]),
+            "lat": row[4], "lon": row[5], "hdop": row[6], "satellites": row[7],
+        } for row in rows]
+        return key, points
+
+    def show_selected_track(self, *_args):
+        """把所选会话坐标传给 Leaflet，在地图上绘制路线和起终点。"""
+        if not hasattr(self, "map_view"):
+            return
+        key, points = self._selected_track_points()
+        if key is None:
+            self.track_info.setText(
+                f"暂无已上传轨迹。轨迹数据库：{self.track_db_path}；地图底图需要网络。"
+            )
+            points = []
+        elif points:
+            self.track_info.setText(
+                f"{key[0]} · {key[1]}：{len(points)} 点，"
+                f"{points[0]['timestamp']} 至 {points[-1]['timestamp']}"
+            )
+        script = "showTrack(" + json.dumps(points, separators=(",", ":")) + ");"
+        self.map_view.page().runJavaScript(script)
+
+    def export_selected_track(self):
+        """将当前会话导出为 GeoJSON LineString，便于在 GIS 软件中查看。"""
+        key, points = self._selected_track_points()
+        if key is None or not points:
+            QMessageBox.information(self, "没有轨迹", "先接收至少一个轨迹点再导出。")
+            return
+        default_name = f"track_{key[1]}.geojson"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出轨迹", default_name, "GeoJSON 文件 (*.geojson *.json)"
+        )
+        if not path:
+            return
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"deviceId": key[0], "sessionId": key[1]},
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[point["lon"], point["lat"]] for point in points],
+                },
+            }],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump(geojson, file, ensure_ascii=False, indent=2)
+            self.connection_label.setText(f"轨迹已导出：{path}")
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
 
     @staticmethod
     def number(value, digits=1):
@@ -275,6 +562,7 @@ class MonitorWindow(QMainWindow):
         vibration = packet.get("vibration") or {}
         gps = packet.get("gps") or {}
         flags = packet.get("flags") or {}
+        track = packet.get("track") or {}
         uptime = packet.get("uptimeMs")
         try:
             uptime = float(uptime)
@@ -320,6 +608,11 @@ class MonitorWindow(QMainWindow):
         self.values["altitude"].setText(f"{self.number(gps.get('altitudeM'))} m")
         self.values["speed"].setText(f"{self.number(gps.get('speedKmph'))} km/h")
         self.values["satellites"].setText(str(gps.get("satellites", "—")))
+        self.values["track"].setText(
+            f"{'可用' if track.get('storageReady') else '不可用'}；"
+            f"待上传 {track.get('pendingPoints', 0)} 点；"
+            f"记录失败 {track.get('droppedPoints', 0)} 点"
+        )
         self.values["mic"].setText(
             f"raw {mic.get('raw', '—')}   P2P {mic.get('p2p', '—')}   RMS {self.number(mic.get('rms'))}"
         )
@@ -399,12 +692,15 @@ class MonitorWindow(QMainWindow):
     def closeEvent(self, event):
         """关闭窗口前停止后台接收，避免线程遗留。"""
         self.receiver.stop()
+        self.track_db.close()
         event.accept()
 
 
 def main():
     """创建 Qt 应用并进入桌面事件循环。"""
     app = QApplication(sys.argv)
+    app.setOrganizationName("GunDetection")
+    app.setApplicationName("GunWifiMonitor")
     window = MonitorWindow()
     window.show()
     sys.exit(app.exec_())
