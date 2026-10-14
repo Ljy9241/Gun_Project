@@ -23,6 +23,7 @@ public:
     void onVibrateEvent(const VibrateEvent& event);
     void update(uint64_t nowUs);
     bool consumeShot(ShotEvent& event, const GpsFix& gpsFix);
+    void resetCandidates();
 
     bool flag1() const { return voiceValid_; }
     bool flag2() const { return vibrationValid_; }

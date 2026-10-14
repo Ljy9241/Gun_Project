@@ -369,6 +369,39 @@ class MonitorWindow(QMainWindow):
                 PRIMARY KEY (device_id, session_id, sequence)
             )"""
         )
+        self.track_db.execute(
+            """CREATE TABLE IF NOT EXISTS shot_events (
+                device_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                shot_id INTEGER NOT NULL,
+                shot_count INTEGER NOT NULL,
+                uptime_ms INTEGER NOT NULL,
+                uptime_us INTEGER NOT NULL,
+                timestamp_source TEXT NOT NULL,
+                utc_date INTEGER NOT NULL,
+                utc_time_ms INTEGER NOT NULL,
+                voice_p2p INTEGER NOT NULL,
+                voice_rms REAL NOT NULL,
+                voice_rise_ratio REAL NOT NULL,
+                accel_x INTEGER NOT NULL,
+                accel_y INTEGER NOT NULL,
+                accel_z INTEGER NOT NULL,
+                accel_peak REAL NOT NULL,
+                accel_jerk REAL NOT NULL,
+                accel_saturated INTEGER NOT NULL,
+                gps_valid INTEGER NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                altitude_m REAL NOT NULL,
+                speed_kmph REAL NOT NULL,
+                hdop REAL NOT NULL,
+                satellites INTEGER NOT NULL,
+                gps_age_ms INTEGER NOT NULL,
+                received_at TEXT NOT NULL,
+                PRIMARY KEY (device_id, session_id, sequence)
+            )"""
+        )
         self.track_db.commit()
 
     def _position_legend(self):
@@ -666,7 +699,8 @@ class MonitorWindow(QMainWindow):
         self.values["track"].setText(
             f"{'可用' if track.get('storageReady') else '不可用'}；"
             f"待上传 {track.get('pendingPoints', 0)} 点；"
-            f"记录失败 {track.get('droppedPoints', 0)} 点"
+            f"记录失败 {track.get('droppedPoints', 0)} 点；"
+            f"射击事件待传 {(packet.get('shotEvents') or {}).get('pending', 0)} 条"
         )
         self.values["mic"].setText(
             f"raw {mic.get('raw', '—')}   P2P {mic.get('p2p', '—')}   RMS {self.number(mic.get('rms'))}"
@@ -683,16 +717,85 @@ class MonitorWindow(QMainWindow):
             self.accel_plot.setXRange(left, max(HISTORY_SECONDS, elapsed), padding=0)
 
     def handle_shot(self, packet):
-        """更新射击计数和最近一次融合事件摘要。"""
+        """先保存持久化射击事件并回 ACK，再更新最近事件摘要。"""
+        device_id = str(packet.get("deviceId", ""))
+        session_id = str(packet.get("sessionId", ""))
+        sequence = packet.get("seq")
+        if device_id and session_id and sequence is not None:
+            try:
+                sequence = int(sequence)
+                if sequence <= 0:
+                    raise ValueError("射击事件序号无效")
+                received_at = datetime.now().isoformat(timespec="milliseconds")
+                self.track_db.execute(
+                    """INSERT OR IGNORE INTO shot_events (
+                        device_id, session_id, sequence, shot_id, shot_count,
+                        uptime_ms, uptime_us, timestamp_source, utc_date, utc_time_ms,
+                        voice_p2p, voice_rms, voice_rise_ratio, accel_x, accel_y, accel_z,
+                        accel_peak, accel_jerk, accel_saturated, gps_valid, latitude,
+                        longitude, altitude_m, speed_kmph, hdop, satellites, gps_age_ms, received_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        device_id, session_id, sequence, int(packet.get("shotId", 0)),
+                        int(packet.get("shotCount", 0)), int(packet.get("uptimeMs", 0)),
+                        int(packet.get("uptimeUs", 0)), str(packet.get("timestampSource", "uptime")),
+                        int(packet.get("utcDate", 0)), int(packet.get("utcTimeMs", 0)),
+                        int(packet.get("voiceP2P", 0)), float(packet.get("voiceRms", 0)),
+                        float(packet.get("voiceRiseRatio", 0)), int(packet.get("accelX", 0)),
+                        int(packet.get("accelY", 0)), int(packet.get("accelZ", 0)),
+                        float(packet.get("accelPeak", 0)), float(packet.get("accelJerk", 0)),
+                        int(bool(packet.get("accelSaturated", False))),
+                        int(bool(packet.get("gpsValid", False))), float(packet.get("latitude", 0)),
+                        float(packet.get("longitude", 0)), float(packet.get("altitudeM", 0)),
+                        float(packet.get("speedKmph", 0)), float(packet.get("hdop", 0)),
+                        int(packet.get("satellites", 0)), int(packet.get("gpsAgeMs", 0xFFFFFFFF)),
+                        received_at,
+                    ),
+                )
+                self.track_db.commit()
+                self._send_shot_ack(packet, session_id, sequence)
+            except (TypeError, ValueError, sqlite3.Error) as exc:
+                self.track_db.rollback()
+                self.show_error(f"射击事件保存失败，设备会稍后重传：{exc}")
+                return
+
         shot_id = packet.get("shotId", "?")
         self.shot_count = int(packet.get("shotCount", self.shot_count + 1) or 0)
         self.values["shots"].setText(str(self.shot_count))
         lat, lon = packet.get("latitude"), packet.get("longitude")
         location = f"GPS {self.number(lat, 7)}, {self.number(lon, 7)}" if packet.get("gpsValid") else "GPS 无效"
         self.values["last_shot"].setText(
-            f"#{shot_id}  声音 P2P {packet.get('voiceP2P', '—')}  "
+            f"#{shot_id}  时间 {self._shot_timestamp(packet)}  声音 P2P {packet.get('voiceP2P', '—')}  "
             f"振动峰值 {self.number(packet.get('accelPeak'))}  {location}"
         )
+
+    def _send_shot_ack(self, packet, session_id, sequence):
+        """射击事件提交到本机 SQLite 后，向设备确认这条 session/seq 记录。"""
+        host = packet.get("_sender_ip")
+        port = packet.get("_sender_port")
+        if not host or not port:
+            return
+        payload = json.dumps({
+            "type": "shot_ack", "sessionId": session_id, "seq": sequence,
+        }, separators=(",", ":")).encode("utf-8")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as ack_socket:
+                ack_socket.sendto(payload, (host, int(port)))
+        except OSError as exc:
+            self.show_error(f"射击事件已保存，但确认包发送失败：{exc}")
+
+    @classmethod
+    def _shot_timestamp(cls, packet):
+        """GPS 已校时时显示本地时间；否则明确显示设备运行时间而不伪造绝对时间。"""
+        if packet.get("utcDate"):
+            local_time = cls._track_timestamp(
+                int(packet.get("utcDate", 0)), int(packet.get("utcTimeMs", 0)),
+                int(packet.get("uptimeMs", 0)),
+            )
+            if packet.get("timestampSource") == "gps_holdover":
+                return local_time + "（由最近 GPS 校时推算）"
+            return local_time
+        return f"设备运行 {int(packet.get('uptimeMs', 0)) / 1000:.1f} 秒（未校时）"
 
     def refresh_display(self):
         """由 Qt 定时器批量刷新曲线，并提示数据流中断。"""

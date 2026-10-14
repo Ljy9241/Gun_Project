@@ -16,6 +16,7 @@ public:
     void begin(uint8_t adcPin);
     void update(uint64_t nowUs);
     bool consumeEvent(VoiceEvent& event);
+    void setSamplingEnabled(bool enabled);
 
     bool flag() const { return eventPending_; }
     uint16_t latestRaw() const { return latestRaw_; }
@@ -44,5 +45,6 @@ private:
     float previousRms_ = 1.0F;
     uint32_t droppedSamples_ = 0;
     bool eventPending_ = false;
+    bool samplingEnabled_ = true;
     VoiceEvent pendingEvent_;
 };

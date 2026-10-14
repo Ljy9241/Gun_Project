@@ -56,16 +56,32 @@ void WifiTransport::begin() {
         Serial.println("Wi-Fi upload disabled: configure WIFI_SSID and UPPER_COMPUTER_HOST.");
         return;
     }
+    setRadioEnabled(true);
+    Serial.printf("Wi-Fi connecting: ssid=%s, UDP target=%s:%u\n", config::WIFI_SSID,
+                  config::UPPER_COMPUTER_HOST, config::UPPER_COMPUTER_PORT);
+}
+
+void WifiTransport::setRadioEnabled(bool enabled) {
+    if (!enabled_ || radioEnabled_ == enabled) return;
+    radioEnabled_ = enabled;
+    if (!enabled) {
+        udp_.stop();
+        ackPortReady_ = false;
+        wasConnected_ = false;
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+        Serial.println("Wi-Fi radio disabled for low-power mode.");
+        return;
+    }
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(true);
     ackPortReady_ = udp_.begin(config::TRACK_ACK_PORT);
-    if (!ackPortReady_) {
-        Serial.printf("UDP local port bind failed: %u\n", config::TRACK_ACK_PORT);
-    }
+    if (!ackPortReady_) Serial.printf("UDP local port bind failed: %u\n", config::TRACK_ACK_PORT);
     WiFi.begin(config::WIFI_SSID, config::WIFI_PASSWORD);
     lastConnectAttemptMs_ = millis();
-    Serial.printf("Wi-Fi connecting: ssid=%s, UDP target=%s:%u\n", config::WIFI_SSID,
-                  config::UPPER_COMPUTER_HOST, config::UPPER_COMPUTER_PORT);
+    lastTrackSendMs_ = 0;
+    lastShotSendMs_ = 0;
+    Serial.println("Wi-Fi radio enabled; pending data will upload after reconnect.");
 }
 
 void WifiTransport::setTelemetry(const WifiTelemetry& telemetry) {
@@ -77,8 +93,9 @@ void WifiTransport::setTelemetry(const WifiTelemetry& telemetry) {
     windowVibrationJerk_ = max(windowVibrationJerk_, telemetry.vibrationJerk);
 }
 
-void WifiTransport::update(uint32_t nowMs, GpsTrackStore& trackStore) {
-    if (!enabled_) {
+void WifiTransport::update(uint32_t nowMs, GpsTrackStore& trackStore,
+                           ShotEventStore& shotStore) {
+    if (!enabled_ || !radioEnabled_) {
         return;
     }
 
@@ -94,7 +111,7 @@ void WifiTransport::update(uint32_t nowMs, GpsTrackStore& trackStore) {
         }
     }
 
-    // 未连接时按间隔重连；连接恢复后再发送队列和周期状态。
+    // 未连接时按间隔重连；连接恢复后发送持久化事件和周期状态。
     if (!isConnected) {
         if (nowMs - lastConnectAttemptMs_ >= config::WIFI_RECONNECT_INTERVAL_MS) {
             lastConnectAttemptMs_ = nowMs;
@@ -109,12 +126,7 @@ void WifiTransport::update(uint32_t nowMs, GpsTrackStore& trackStore) {
     }
 
     if (ackPortReady_) {
-        receiveTrackAcks(trackStore);
-    }
-
-    if (count_ > 0 && send(queue_[tail_])) {
-        tail_ = (tail_ + 1) % QUEUE_SIZE;
-        --count_;
+        receiveAcks(trackStore, shotStore);
     }
 
     if (nowMs - lastStatusMs_ >= config::UDP_STATUS_INTERVAL_MS) {
@@ -134,9 +146,17 @@ void WifiTransport::update(uint32_t nowMs, GpsTrackStore& trackStore) {
             sendTrackBatch(batch);
         }
     }
+
+    if (ackPortReady_ && nowMs - lastShotSendMs_ >= config::TRACK_UPLOAD_RETRY_MS) {
+        ShotUpload shot;
+        if (shotStore.peek(shot)) {
+            lastShotSendMs_ = nowMs;
+            sendShot(shot);
+        }
+    }
 }
 
-void WifiTransport::receiveTrackAcks(GpsTrackStore& trackStore) {
+void WifiTransport::receiveAcks(GpsTrackStore& trackStore, ShotEventStore& shotStore) {
     while (udp_.parsePacket() > 0) {
         char payload[256];
         const int length = udp_.read(reinterpret_cast<uint8_t*>(payload), sizeof(payload) - 1);
@@ -147,15 +167,17 @@ void WifiTransport::receiveTrackAcks(GpsTrackStore& trackStore) {
         char type[32];
         char sessionId[17];
         uint32_t sequence = 0;
-        if (jsonStringField(payload, "type", type, sizeof(type)) &&
-            strcmp(type, "track_ack") == 0 &&
-            jsonStringField(payload, "sessionId", sessionId, sizeof(sessionId)) &&
-            jsonUintField(payload, "seq", sequence) &&
-            trackStore.acknowledge(sessionId, sequence)) {
-            Serial.printf("GPS track ACK: session=%s seq=%lu pending=%lu\n", sessionId,
-                          static_cast<unsigned long>(sequence),
-                          static_cast<unsigned long>(trackStore.pendingPoints()));
+        if (!jsonStringField(payload, "type", type, sizeof(type)) ||
+            !jsonStringField(payload, "sessionId", sessionId, sizeof(sessionId)) ||
+            !jsonUintField(payload, "seq", sequence)) continue;
+        if (strcmp(type, "track_ack") == 0 && trackStore.acknowledge(sessionId, sequence)) {
             lastTrackSendMs_ = 0;
+        } else if (strcmp(type, "shot_ack") == 0 &&
+                   shotStore.acknowledge(sessionId, sequence)) {
+            Serial.printf("Shot event ACK: session=%s seq=%lu pending=%lu\n", sessionId,
+                          static_cast<unsigned long>(sequence),
+                          static_cast<unsigned long>(shotStore.pendingEvents()));
+            lastShotSendMs_ = 0;
         }
     }
 }
@@ -175,13 +197,14 @@ bool WifiTransport::sendStatus(uint32_t nowMs) {
         "\"maxJerk5s\":%.1f},"
         "\"flags\":{\"voice\":%s,\"vibration\":%s},"
         "\"shotCount\":%lu,\"sentShots\":%lu,"
-        "\"udp\":{\"queued\":%u,\"failed\":%lu,\"dropped\":%lu},"
+        "\"udp\":{\"queued\":0,\"failed\":%lu,\"dropped\":%lu},"
         "\"gps\":{\"valid\":%s,\"latitude\":%.7f,\"longitude\":%.7f,"
         "\"altitudeM\":%.1f,\"speedKmph\":%.1f,\"hdop\":%.1f,"
         "\"satellites\":%lu,\"ageMs\":%lu,\"chars\":%lu,"
         "\"failedChecksums\":%lu},"
         "\"sampleDrops\":{\"voice\":%lu,\"vibration\":%lu},"
-        "\"track\":{\"storageReady\":%s,\"pendingPoints\":%lu,\"droppedPoints\":%lu}}\r\n",
+        "\"track\":{\"storageReady\":%s,\"pendingPoints\":%lu,\"droppedPoints\":%lu},"
+        "\"shotEvents\":{\"storageReady\":%s,\"pending\":%lu,\"dropped\":%lu}}\r\n",
         config::DEVICE_ID, static_cast<unsigned long>(nowMs), localIp.c_str(),
         static_cast<long>(WiFi.RSSI()), telemetry_.micRaw, telemetry_.micPeakToPeak,
         telemetry_.micRms, windowMicPeakToPeak_, windowMicRms_,
@@ -191,7 +214,7 @@ bool WifiTransport::sendStatus(uint32_t nowMs) {
         telemetry_.voiceFlag ? "true" : "false",
         telemetry_.vibrationFlag ? "true" : "false",
         static_cast<unsigned long>(telemetry_.shotCount),
-        static_cast<unsigned long>(sentEvents_), count_,
+        static_cast<unsigned long>(sentEvents_),
         static_cast<unsigned long>(failedSends_),
         static_cast<unsigned long>(droppedEvents_),
         telemetry_.gpsValid ? "true" : "false",
@@ -205,7 +228,10 @@ bool WifiTransport::sendStatus(uint32_t nowMs) {
         static_cast<unsigned long>(telemetry_.vibrationDroppedSamples),
         telemetry_.trackStorageReady ? "true" : "false",
         static_cast<unsigned long>(telemetry_.trackPendingPoints),
-        static_cast<unsigned long>(telemetry_.trackDroppedPoints));
+        static_cast<unsigned long>(telemetry_.trackDroppedPoints),
+        telemetry_.shotStorageReady ? "true" : "false",
+        static_cast<unsigned long>(telemetry_.pendingShotEvents),
+        static_cast<unsigned long>(telemetry_.droppedShotEvents));
 
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(payload) ||
         !udp_.beginPacket(config::UPPER_COMPUTER_HOST, config::UPPER_COMPUTER_PORT)) {
@@ -246,80 +272,17 @@ bool WifiTransport::sendTrackBatch(const TrackBatch& batch) {
     return true;
 }
 
-bool WifiTransport::enqueue(const ShotEvent& event) {
-    if (!enabled_) {
-        return false;
-    }
-    if (count_ >= QUEUE_SIZE) {
-        ++droppedEvents_;
-        Serial.printf("UDP queue full: dropped shotId=%lu, totalDropped=%lu\n",
-                      static_cast<unsigned long>(event.shotId),
-                      static_cast<unsigned long>(droppedEvents_));
-        return false;
-    }
-    // 环形队列满时丢弃新事件；否则按 FIFO 顺序等待网络发送。
-    queue_[head_] = event;
-    head_ = (head_ + 1) % QUEUE_SIZE;
-    ++count_;
-    lastShotCount_ = event.shotCount;
-    return true;
-}
-
-bool WifiTransport::send(const ShotEvent& event) {
-    // 射击包保留事件发生时的传感器特征和定位信息，便于上位机记录。
-    char payload[512];
-    const int length = snprintf(
-        payload, sizeof(payload),
-        "{\"type\":\"shot\",\"deviceId\":\"%s\",\"shotId\":%lu,"
-        "\"shotCount\":%lu,\"uptimeUs\":%llu,"
-        "\"voiceP2P\":%u,\"voiceRms\":%.1f,\"voiceRiseRatio\":%.2f,"
-        "\"accelX\":%u,\"accelY\":%u,\"accelZ\":%u,"
-        "\"accelPeak\":%.1f,\"accelJerk\":%.1f,\"accelSaturated\":%s,"
-        "\"gpsValid\":%s,\"latitude\":%.7f,\"longitude\":%.7f,\"altitudeM\":%.1f,"
-        "\"speedKmph\":%.1f,\"hdop\":%.1f,\"satellites\":%lu,\"gpsAgeMs\":%lu}\r\n",
-        config::DEVICE_ID, static_cast<unsigned long>(event.shotId),
-        static_cast<unsigned long>(event.shotCount),
-        static_cast<unsigned long long>(event.timestampUs), event.voice.peakToPeak,
-        event.voice.rms, event.voice.riseRatio, event.vibration.rawX,
-        event.vibration.rawY, event.vibration.rawZ, event.vibration.peakMagnitude,
-        event.vibration.peakJerk, event.vibration.saturated ? "true" : "false",
-        event.gps.valid ? "true" : "false", event.gps.latitude, event.gps.longitude,
-        event.gps.altitudeM, event.gps.speedKmph, event.gps.hdop,
-        static_cast<unsigned long>(event.gps.satellites),
-        static_cast<unsigned long>(event.gps.ageMs));
-    if (length <= 0 || static_cast<size_t>(length) >= sizeof(payload)) {
+bool WifiTransport::sendShot(const ShotUpload& shot) {
+    if (!shot.length || !udp_.beginPacket(config::UPPER_COMPUTER_HOST,
+                                          config::UPPER_COMPUTER_PORT)) {
         ++failedSends_;
-        Serial.printf("UDP TX encode failed: shotId=%lu, requiredBytes=%d\n",
-                      static_cast<unsigned long>(event.shotId), length);
         return false;
     }
-
-    if (!udp_.beginPacket(config::UPPER_COMPUTER_HOST, config::UPPER_COMPUTER_PORT)) {
-        ++failedSends_;
-        const uint32_t nowMs = millis();
-        if (nowMs - lastSendErrorLogMs_ >= 1000) {
-            lastSendErrorLogMs_ = nowMs;
-            Serial.printf("UDP TX failed: beginPacket %s:%u, shotId=%lu\n",
-                          config::UPPER_COMPUTER_HOST, config::UPPER_COMPUTER_PORT,
-                          static_cast<unsigned long>(event.shotId));
-        }
-        return false;
-    }
-    udp_.write(reinterpret_cast<const uint8_t*>(payload), length);
-    if (udp_.endPacket() != 1) {
-        ++failedSends_;
-        const uint32_t nowMs = millis();
-        if (nowMs - lastSendErrorLogMs_ >= 1000) {
-            lastSendErrorLogMs_ = nowMs;
-            Serial.printf("UDP TX failed: endPacket %s:%u, shotId=%lu\n",
-                          config::UPPER_COMPUTER_HOST, config::UPPER_COMPUTER_PORT,
-                          static_cast<unsigned long>(event.shotId));
-        }
-        return false;
-    }
-
+    udp_.write(reinterpret_cast<const uint8_t*>(shot.payload), shot.length);
+    if (udp_.endPacket() != 1) { ++failedSends_; return false; }
     ++sentEvents_;
-    Serial.printf("UDP TX OK -> %s:%u bytes=%d: %s\n", config::UPPER_COMPUTER_HOST,
-                  config::UPPER_COMPUTER_PORT, length, payload);
+    Serial.printf("Shot event sent: session=%s seq=%lu bytes=%u\n", shot.sessionId,
+                  static_cast<unsigned long>(shot.sequence),
+                  static_cast<unsigned>(shot.length));
     return true;
 }

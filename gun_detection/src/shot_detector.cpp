@@ -61,3 +61,9 @@ bool ShotDetector::consumeShot(ShotEvent& event, const GpsFix& gpsFix) {
     shotPending_ = false;
     return true;
 }
+
+void ShotDetector::resetCandidates() {
+    voiceValid_ = false;
+    vibrationValid_ = false;
+    shotPending_ = false;
+}

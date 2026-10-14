@@ -5,6 +5,7 @@
 #include <WiFiUdp.h>
 
 #include "gps_track_store.h"
+#include "shot_event_store.h"
 #include "shot_detector.h"
 
 // 定时状态包所需的传感器快照和运行统计。
@@ -36,45 +37,42 @@ struct WifiTelemetry {
     bool trackStorageReady = false;
     uint32_t trackPendingPoints = 0;
     uint32_t trackDroppedPoints = 0;
+    bool shotStorageReady = false;
+    uint32_t pendingShotEvents = 0;
+    uint32_t droppedShotEvents = 0;
 };
 
 class WifiTransport {
 public:
     // 建立 Wi-Fi 站点连接；网络不可用时由 update 周期重试。
     void begin();
+    void setRadioEnabled(bool enabled);
     void setTelemetry(const WifiTelemetry& telemetry);
-    void update(uint32_t nowMs, GpsTrackStore& trackStore);
-    bool enqueue(const ShotEvent& event);
+    void update(uint32_t nowMs, GpsTrackStore& trackStore, ShotEventStore& shotStore);
 
     bool enabled() const { return enabled_; }
+    bool radioEnabled() const { return radioEnabled_; }
     bool connected() const { return WiFi.status() == WL_CONNECTED; }
-    uint8_t queuedEvents() const { return count_; }
     uint32_t sentEvents() const { return sentEvents_; }
     uint32_t sentStatuses() const { return sentStatuses_; }
     uint32_t failedSends() const { return failedSends_; }
     uint32_t droppedEvents() const { return droppedEvents_; }
 
 private:
-    static constexpr uint8_t QUEUE_SIZE = 16;
-    // 发送队列中的射击事件；失败时保留队首等待后续重试。
-    bool send(const ShotEvent& event);
+    bool sendShot(const ShotUpload& shot);
     bool sendTrackBatch(const TrackBatch& batch);
     // 上报周期状态包及最近一个统计窗口的传感器峰值。
     bool sendStatus(uint32_t nowMs);
-    void receiveTrackAcks(GpsTrackStore& trackStore);
+    void receiveAcks(GpsTrackStore& trackStore, ShotEventStore& shotStore);
 
     WiFiUDP udp_;
-    ShotEvent queue_[QUEUE_SIZE];
-    uint8_t head_ = 0;  // 下一个写入位置。
-    uint8_t tail_ = 0;
-    uint8_t count_ = 0;
     uint32_t lastConnectAttemptMs_ = 0;
     uint32_t lastStatusMs_ = 0;
     uint32_t lastSendErrorLogMs_ = 0;
     uint32_t lastTrackSendMs_ = 0;
+    uint32_t lastShotSendMs_ = 0;
     uint32_t sentEvents_ = 0;
     uint32_t sentStatuses_ = 0;
-    uint32_t lastShotCount_ = 0;
     uint32_t failedSends_ = 0;
     uint32_t droppedEvents_ = 0;
     WifiTelemetry telemetry_;
@@ -85,4 +83,5 @@ private:
     bool enabled_ = false;
     bool wasConnected_ = false;
     bool ackPortReady_ = false;
+    bool radioEnabled_ = false;
 };

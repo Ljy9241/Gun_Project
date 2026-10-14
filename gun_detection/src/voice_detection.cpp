@@ -1,6 +1,7 @@
 #include "voice_detection.h"
 
 #include <math.h>
+#include <esp_timer.h>
 
 #include "system_config.h"
 
@@ -13,6 +14,19 @@ void VoiceDetection::begin(uint8_t adcPin) {
     resetFrame();
 }
 
+void VoiceDetection::setSamplingEnabled(bool enabled) {
+    if (samplingEnabled_ == enabled) {
+        return;
+    }
+    samplingEnabled_ = enabled;
+    eventPending_ = false;
+    resetFrame();
+    if (enabled) {
+        nextSampleUs_ = esp_timer_get_time();
+        previousRms_ = 1.0F;
+    }
+}
+
 void VoiceDetection::resetFrame() {
     // 帧统计只保留当前窗口的极值、和与平方和。
     sampleCount_ = 0;
@@ -23,6 +37,9 @@ void VoiceDetection::resetFrame() {
 }
 
 void VoiceDetection::update(uint64_t nowUs) {
+    if (!samplingEnabled_) {
+        return;
+    }
     if (nowUs < nextSampleUs_) {
         return;
     }

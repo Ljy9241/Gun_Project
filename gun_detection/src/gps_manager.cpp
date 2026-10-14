@@ -5,6 +5,7 @@
 void GpsManager::begin(uint8_t enablePin, uint8_t ppsPin, int8_t rxPin, int8_t txPin,
                        uint32_t baud) {
     enablePin_ = enablePin;
+    enabled_ = true;
     ppsPin_ = ppsPin;
     pinMode(enablePin_, OUTPUT);
     digitalWrite(enablePin_, HIGH);  // 当前硬件配置为高电平使能 GPS。
@@ -12,7 +13,21 @@ void GpsManager::begin(uint8_t enablePin, uint8_t ppsPin, int8_t rxPin, int8_t t
     serial_.begin(baud, SERIAL_8N1, rxPin, txPin);
 }
 
+void GpsManager::setEnabled(bool enabled) {
+    if (enabled_ == enabled) {
+        return;
+    }
+    enabled_ = enabled;
+    digitalWrite(enablePin_, enabled ? HIGH : LOW);
+    if (!enabled) {
+        locationUpdatePending_ = false;
+    }
+}
+
 void GpsManager::update() {
+    if (!enabled_) {
+        return;
+    }
     // 尽可能清空串口接收缓冲区，避免主循环期间 NMEA 数据积压。
     while (serial_.available() > 0) {
         gps_.encode(static_cast<char>(serial_.read()));
@@ -44,7 +59,10 @@ GpsFix GpsManager::currentFix() {
     if (gps_.satellites.isValid()) {
         fix.satellites = gps_.satellites.value();
     }
-    if (gps_.date.isValid() && gps_.time.isValid()) {
+    if (gps_.date.isValid() && gps_.time.isValid() &&
+        gps_.date.age() <= config::GPS_MAX_FIX_AGE_MS &&
+        gps_.time.age() <= config::GPS_MAX_FIX_AGE_MS) {
+        fix.utcAgeMs = max(gps_.date.age(), gps_.time.age());
         fix.utcDate = static_cast<uint32_t>(gps_.date.year()) * 10000UL +
                       static_cast<uint32_t>(gps_.date.month()) * 100UL + gps_.date.day();
         fix.utcTimeMs = static_cast<uint32_t>(gps_.time.hour()) * 3600000UL +

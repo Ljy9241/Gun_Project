@@ -1,6 +1,7 @@
 #include "vibrate_detection.h"
 
 #include <math.h>
+#include <esp_timer.h>
 
 #include "system_config.h"
 
@@ -20,7 +21,8 @@ void VibrateDetection::begin(uint8_t xPin, uint8_t yPin, uint8_t zPin, uint8_t s
     analogSetPinAttenuation(zPin_, ADC_11db);
 
     sampleIntervalUs_ = 1000000UL / config::VIBRATE_SAMPLE_RATE_HZ;
-    nextSampleUs_ = micros() + 1000;  // MMA7361 enable response is sub-millisecond.
+    nextSampleUs_ = static_cast<uint64_t>(esp_timer_get_time()) + 1000;
+    motionWindowStartUs_ = nextSampleUs_;
 }
 
 void VibrateDetection::update(uint64_t nowUs) {
@@ -38,6 +40,49 @@ void VibrateDetection::update(uint64_t nowUs) {
     rawX_ = analogRead(xPin_);
     rawY_ = analogRead(yPin_);
     rawZ_ = analogRead(zPin_);
+
+    // 低功耗判定使用短窗口内三轴 ADC 的峰峰值，不把静态重力值误判为运动。
+    motionMinX_ = min(motionMinX_, rawX_);
+    motionMinY_ = min(motionMinY_, rawY_);
+    motionMinZ_ = min(motionMinZ_, rawZ_);
+    motionMaxX_ = max(motionMaxX_, rawX_);
+    motionMaxY_ = max(motionMaxY_, rawY_);
+    motionMaxZ_ = max(motionMaxZ_, rawZ_);
+    if (nowUs - motionWindowStartUs_ >= config::MOTION_WINDOW_US) {
+        const uint64_t elapsedUs = nowUs - motionWindowStartUs_;
+        const uint16_t deltaX = motionMaxX_ - motionMinX_;
+        const uint16_t deltaY = motionMaxY_ - motionMinY_;
+        const uint16_t deltaZ = motionMaxZ_ - motionMinZ_;
+        const uint16_t largestDelta = max(deltaX, max(deltaY, deltaZ));
+        const bool stableWindow = elapsedUs <= config::MOTION_WINDOW_US * 2ULL &&
+                                  largestDelta <= config::MOTION_STILL_AXIS_DELTA;
+        if (stableWindow) {
+            stationaryDurationMs_ += static_cast<uint32_t>(elapsedUs / 1000ULL);
+            if (stationaryDurationMs_ > config::LOW_POWER_STATIONARY_MS) {
+                stationaryDurationMs_ = config::LOW_POWER_STATIONARY_MS;
+            }
+            wakeWindows_ = 0;
+            weakMotionWindows_ = 0;
+        } else {
+            stationaryDurationMs_ = 0;
+            if (largestDelta >= config::MOTION_WAKE_AXIS_DELTA) {
+                weakMotionWindows_ = 0;
+                if (wakeWindows_ < 2) ++wakeWindows_;
+                if (wakeWindows_ >= 2) movementPending_ = true;
+            } else if (largestDelta > config::MOTION_STILL_AXIS_DELTA) {
+                wakeWindows_ = 0;
+                if (weakMotionWindows_ < 5) ++weakMotionWindows_;
+                if (weakMotionWindows_ >= 5) movementPending_ = true;
+            } else {
+                wakeWindows_ = 0;
+                weakMotionWindows_ = 0;
+            }
+        }
+
+        motionWindowStartUs_ = nowUs;
+        motionMinX_ = motionMinY_ = motionMinZ_ = 4095;
+        motionMaxX_ = motionMaxY_ = motionMaxZ_ = 0;
+    }
 
     // 上电初期取静止样本均值作为重力与安装方向的基线。
     if (!calibrated_) {
@@ -108,4 +153,34 @@ bool VibrateDetection::consumeEvent(VibrateEvent& event) {
     event = pendingEvent_;
     eventPending_ = false;
     return true;
+}
+
+bool VibrateDetection::consumeMovement() {
+    const bool detected = movementPending_;
+    movementPending_ = false;
+    return detected;
+}
+
+void VibrateDetection::clearPendingEvent() {
+    eventPending_ = false;
+    consecutiveTriggerSamples_ = 0;
+    candidatePeakMagnitude_ = 0.0F;
+    candidatePeakJerk_ = 0.0F;
+    candidateSaturated_ = false;
+}
+
+bool VibrateDetection::stationaryForLowPower() const {
+    return calibrated_ && stationaryDurationMs_ >= config::LOW_POWER_STATIONARY_MS;
+}
+
+void VibrateDetection::setSampleIntervalUs(uint32_t intervalUs) {
+    if (intervalUs == 0 || intervalUs == sampleIntervalUs_) return;
+    sampleIntervalUs_ = intervalUs;
+    nextSampleUs_ = static_cast<uint64_t>(esp_timer_get_time());
+    motionWindowStartUs_ = nextSampleUs_;
+    motionMinX_ = motionMinY_ = motionMinZ_ = 4095;
+    motionMaxX_ = motionMaxY_ = motionMaxZ_ = 0;
+    stationaryDurationMs_ = 0;
+    wakeWindows_ = 0;
+    weakMotionWindows_ = 0;
 }

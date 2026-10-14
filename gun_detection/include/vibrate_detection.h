@@ -19,6 +19,10 @@ public:
     void begin(uint8_t xPin, uint8_t yPin, uint8_t zPin, uint8_t sleepPin);
     void update(uint64_t nowUs);
     bool consumeEvent(VibrateEvent& event);  // 取走单个待处理事件。
+    bool stationaryForLowPower() const;
+    bool consumeMovement();
+    void setSampleIntervalUs(uint32_t intervalUs);
+    void clearPendingEvent();
 
     bool flag() const { return eventPending_; }
     bool calibrated() const { return calibrated_; }
@@ -59,4 +63,15 @@ private:
     bool calibrated_ = false;
     bool eventPending_ = false;
     VibrateEvent pendingEvent_;
+    uint64_t motionWindowStartUs_ = 0;
+    uint16_t motionMinX_ = 4095;
+    uint16_t motionMinY_ = 4095;
+    uint16_t motionMinZ_ = 4095;
+    uint16_t motionMaxX_ = 0;
+    uint16_t motionMaxY_ = 0;
+    uint16_t motionMaxZ_ = 0;
+    uint32_t stationaryDurationMs_ = 0;
+    uint8_t wakeWindows_ = 0;
+    uint8_t weakMotionWindows_ = 0;
+    bool movementPending_ = false;
 };
