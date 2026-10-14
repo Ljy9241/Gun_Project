@@ -29,16 +29,16 @@ inline constexpr uint16_t TRACK_ACK_PORT = 8889;
 // 声音检测参数：当前为初始值，实际使用前应结合采集数据校准。
 inline constexpr uint32_t VOICE_SAMPLE_RATE_HZ = 8000;
 inline constexpr uint16_t VOICE_FRAME_SAMPLES = 80;  // 10 ms at 8 kHz
-inline constexpr uint16_t VOICE_P2P_THRESHOLD = 120; // P2P 不低于 120 ADC 计数；
-inline constexpr float VOICE_RMS_THRESHOLD = 10.0F;  // RMS 不低于 10；
-inline constexpr float VOICE_RISE_RATIO = 1.5F;  // RMS 相对背景的上升比例不低于 1.5；
+inline constexpr uint16_t VOICE_P2P_THRESHOLD = 20; // 峰峰值不低于 20 ADC 计数。
+inline constexpr float VOICE_RMS_THRESHOLD = 3.0F;  // RMS 不低于 3。
+inline constexpr float VOICE_RISE_RATIO = 1.0F;  // RMS 相对背景的上升比例不低于 1.5；
 inline constexpr uint32_t VOICE_RETRIGGER_US = 50000;  // 距离上次声音触发至少 50 ms。
 
 // MMA7361 振动检测参数；PCB 将 G-SELECT 拉高，因此量程为 +/-6 g。
 inline constexpr uint32_t VIBRATE_SAMPLE_RATE_HZ = 1000;
 inline constexpr uint16_t VIBRATE_CALIBRATION_SAMPLES = 300;
-inline constexpr float VIBRATE_PEAK_THRESHOLD_COUNTS = 300.0F;
-inline constexpr float VIBRATE_JERK_THRESHOLD_COUNTS = 150.0F;
+inline constexpr float VIBRATE_PEAK_THRESHOLD_COUNTS = 200.0F;// 触发逻辑要求幅值至少为 200，
+inline constexpr float VIBRATE_JERK_THRESHOLD_COUNTS = 120.0F;//候选冲击开始时变化量至少为 120；
 inline constexpr float VIBRATE_QUIET_THRESHOLD_COUNTS = 90.0F;
 // 低功耗状态检测使用 100 ms 三轴 ADC 窗口峰峰值；阈值需按实物噪声校准。
 inline constexpr uint32_t MOTION_WINDOW_US = 100000;
@@ -46,7 +46,7 @@ inline constexpr uint16_t MOTION_STILL_AXIS_DELTA = 45;
 inline constexpr uint16_t MOTION_WAKE_AXIS_DELTA = 75;
 inline constexpr uint32_t LOW_POWER_STATIONARY_MS = 5000;
 inline constexpr uint32_t LOW_POWER_POLL_INTERVAL_US = 10000;
-inline constexpr uint8_t VIBRATE_TRIGGER_SAMPLES = 2;
+inline constexpr uint8_t VIBRATE_TRIGGER_SAMPLES = 2;  //且随后需要达到连续触发样本数（默认 2）才生成事件
 inline constexpr uint32_t VIBRATE_RETRIGGER_US = 50000;
 
 // 声音与振动事件的融合窗口及融合后的重复触发冷却时间。

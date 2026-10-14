@@ -28,6 +28,8 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -324,9 +326,37 @@ class MonitorWindow(QMainWindow):
         self.map_view.setHtml(self._track_map_html())
         self.map_view.loadFinished.connect(lambda _ok: self.show_selected_track())
         map_layout.addWidget(self.map_view, 1)
+
+        shot_page = QWidget()
+        shot_layout = QVBoxLayout(shot_page)
+        shot_controls = QHBoxLayout()
+        shot_controls.addWidget(QLabel("电脑已接收并保存的射击事件"))
+        refresh_shots_button = QPushButton("刷新列表")
+        refresh_shots_button.clicked.connect(self.refresh_shot_events)
+        shot_controls.addWidget(refresh_shots_button)
+        export_shots_button = QPushButton("导出射击事件 CSV")
+        export_shots_button.clicked.connect(self.export_shot_events)
+        shot_controls.addWidget(export_shots_button)
+        shot_layout.addLayout(shot_controls)
+        shot_layout.addWidget(QLabel(
+            "事件写入电脑数据库后会自动确认设备上传；导出会另存 CSV，不会删除电脑数据库记录。"
+        ))
+        self.shot_table = QTableWidget(0, 10)
+        self.shot_table.setHorizontalHeaderLabels([
+            "接收时间", "设备", "事件编号", "检测次数", "事件时间", "GPS 状态",
+            "纬度", "经度", "声音 P2P", "振动峰值",
+        ])
+        self.shot_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.shot_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.shot_table.setAlternatingRowColors(True)
+        self.shot_table.horizontalHeader().setStretchLastSection(True)
+        shot_layout.addWidget(self.shot_table, 1)
+
         self.pages.addTab(plot_page, "加速度曲线")
         self.pages.addTab(map_page, "GPS 轨迹地图")
+        self.pages.addTab(shot_page, "射击事件")
         self.refresh_track_sessions()
+        self.refresh_shot_events()
         main.setContentsMargins(8, 8, 8, 8)
         self.setCentralWidget(root)
 
@@ -556,17 +586,25 @@ class MonitorWindow(QMainWindow):
     def _track_timestamp(utc_date, utc_time_ms, uptime_ms):
         """将 GPS UTC 时间转换为电脑本地时间；日期无效时回退到设备运行时间。"""
         if utc_date:
-            date = f"{utc_date:08d}"
-            milliseconds = max(0, utc_time_ms)
-            hour, milliseconds = divmod(milliseconds, 3_600_000)
-            minute, milliseconds = divmod(milliseconds, 60_000)
-            second, milliseconds = divmod(milliseconds, 1_000)
-            gps_utc = datetime.strptime(
-                f"{date} {hour:02d}:{minute:02d}:{second:02d}.{milliseconds:03d}",
-                "%Y%m%d %H:%M:%S.%f",
-            ).replace(tzinfo=timezone.utc)
-            local_time = gps_utc.astimezone()
-            return local_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " 本地时间"
+            try:
+                date_value = int(utc_date)
+                milliseconds = int(utc_time_ms)
+                if not 10_000_101 <= date_value <= 99_991_231:
+                    raise ValueError("GPS 日期超出有效范围")
+                if not 0 <= milliseconds < 86_400_000:
+                    raise ValueError("GPS 当天时间超出有效范围")
+                date = f"{date_value:08d}"
+                hour, milliseconds = divmod(milliseconds, 3_600_000)
+                minute, milliseconds = divmod(milliseconds, 60_000)
+                second, milliseconds = divmod(milliseconds, 1_000)
+                gps_utc = datetime.strptime(
+                    f"{date} {hour:02d}:{minute:02d}:{second:02d}.{milliseconds:03d}",
+                    "%Y%m%d %H:%M:%S.%f",
+                ).replace(tzinfo=timezone.utc)
+                local_time = gps_utc.astimezone()
+                return local_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " 本地时间"
+            except (TypeError, ValueError, OverflowError):
+                pass
         return f"设备运行 {uptime_ms / 1000:.1f} 秒"
 
     def _selected_track_points(self):
@@ -700,7 +738,9 @@ class MonitorWindow(QMainWindow):
             f"{'可用' if track.get('storageReady') else '不可用'}；"
             f"待上传 {track.get('pendingPoints', 0)} 点；"
             f"记录失败 {track.get('droppedPoints', 0)} 点；"
-            f"射击事件待传 {(packet.get('shotEvents') or {}).get('pending', 0)} 条"
+            f"射击事件存储 {'可用' if (packet.get('shotEvents') or {}).get('storageReady') else '不可用'}；"
+            f"待传 {(packet.get('shotEvents') or {}).get('pending', 0)} 条；"
+            f"记录失败 {(packet.get('shotEvents') or {}).get('dropped', 0)} 条"
         )
         self.values["mic"].setText(
             f"raw {mic.get('raw', '—')}   P2P {mic.get('p2p', '—')}   RMS {self.number(mic.get('rms'))}"
@@ -718,6 +758,17 @@ class MonitorWindow(QMainWindow):
 
     def handle_shot(self, packet):
         """先保存持久化射击事件并回 ACK，再更新最近事件摘要。"""
+        # 事件包一到就更新界面；数据库异常不能让已收到的事件在界面上消失。
+        shot_id = packet.get("shotId", "?")
+        self.shot_count = int(packet.get("shotCount", self.shot_count + 1) or 0)
+        self.values["shots"].setText(str(self.shot_count))
+        lat, lon = packet.get("latitude"), packet.get("longitude")
+        location = f"GPS {self.number(lat, 7)}, {self.number(lon, 7)}" if packet.get("gpsValid") else "GPS 无效"
+        self.values["last_shot"].setText(
+            f"#{shot_id}  时间 {self._shot_timestamp(packet)}  声音 P2P {packet.get('voiceP2P', '—')}  "
+            f"振动峰值 {self.number(packet.get('accelPeak'))}  {location}"
+        )
+
         device_id = str(packet.get("deviceId", ""))
         session_id = str(packet.get("sessionId", ""))
         sequence = packet.get("seq")
@@ -753,21 +804,12 @@ class MonitorWindow(QMainWindow):
                     ),
                 )
                 self.track_db.commit()
-                self._send_shot_ack(packet, session_id, sequence)
             except (TypeError, ValueError, sqlite3.Error) as exc:
                 self.track_db.rollback()
                 self.show_error(f"射击事件保存失败，设备会稍后重传：{exc}")
                 return
-
-        shot_id = packet.get("shotId", "?")
-        self.shot_count = int(packet.get("shotCount", self.shot_count + 1) or 0)
-        self.values["shots"].setText(str(self.shot_count))
-        lat, lon = packet.get("latitude"), packet.get("longitude")
-        location = f"GPS {self.number(lat, 7)}, {self.number(lon, 7)}" if packet.get("gpsValid") else "GPS 无效"
-        self.values["last_shot"].setText(
-            f"#{shot_id}  时间 {self._shot_timestamp(packet)}  声音 P2P {packet.get('voiceP2P', '—')}  "
-            f"振动峰值 {self.number(packet.get('accelPeak'))}  {location}"
-        )
+            self._send_shot_ack(packet, session_id, sequence)
+            self.refresh_shot_events()
 
     def _send_shot_ack(self, packet, session_id, sequence):
         """射击事件提交到本机 SQLite 后，向设备确认这条 session/seq 记录。"""
@@ -784,6 +826,68 @@ class MonitorWindow(QMainWindow):
         except OSError as exc:
             self.show_error(f"射击事件已保存，但确认包发送失败：{exc}")
 
+    def refresh_shot_events(self):
+        """从本机 SQLite 刷新射击事件页；只列出已成功接收并提交的事件。"""
+        if not hasattr(self, "shot_table"):
+            return
+        rows = self.track_db.execute(
+            """SELECT received_at, device_id, shot_id, shot_count, uptime_ms,
+                      timestamp_source, utc_date, utc_time_ms, gps_valid, latitude,
+                      longitude, voice_p2p, accel_peak
+               FROM shot_events ORDER BY received_at DESC, shot_count DESC"""
+        ).fetchall()
+        self.shot_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            received_at, device_id, shot_id, shot_count, uptime_ms = row[:5]
+            timestamp_source, utc_date, utc_time_ms = row[5:8]
+            gps_valid, latitude, longitude, voice_p2p, accel_peak = row[8:]
+            timestamp_packet = {
+                "uptimeMs": uptime_ms,
+                "timestampSource": timestamp_source,
+                "utcDate": utc_date,
+                "utcTimeMs": utc_time_ms,
+            }
+            values = [
+                received_at,
+                device_id,
+                str(shot_id),
+                str(shot_count),
+                self._shot_timestamp(timestamp_packet),
+                "有效" if gps_valid else "无效",
+                self.number(latitude, 7) if gps_valid else "—",
+                self.number(longitude, 7) if gps_valid else "—",
+                str(voice_p2p),
+                self.number(accel_peak),
+            ]
+            for column, value in enumerate(values):
+                self.shot_table.setItem(row_index, column, QTableWidgetItem(str(value)))
+
+    def export_shot_events(self):
+        """将本机数据库中已接收的射击事件完整导出为 CSV。"""
+        rows = self.track_db.execute(
+            "SELECT * FROM shot_events ORDER BY received_at ASC, shot_count ASC"
+        ).fetchall()
+        if not rows:
+            QMessageBox.information(self, "没有射击事件", "电脑数据库中还没有已接收的射击事件。")
+            return
+        columns = [item[1] for item in self.track_db.execute("PRAGMA table_info(shot_events)")]
+        default_name = f"gun_shot_events_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出射击事件", default_name, "CSV 文件 (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                writer.writerow(columns)
+                writer.writerows(rows)
+            self.connection_label.setText(
+                f"已导出 {len(rows)} 条射击事件：{path}（电脑数据库中的记录仍保留）"
+            )
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+
     @classmethod
     def _shot_timestamp(cls, packet):
         """GPS 已校时时显示本地时间；否则明确显示设备运行时间而不伪造绝对时间。"""
@@ -792,7 +896,7 @@ class MonitorWindow(QMainWindow):
                 int(packet.get("utcDate", 0)), int(packet.get("utcTimeMs", 0)),
                 int(packet.get("uptimeMs", 0)),
             )
-            if packet.get("timestampSource") == "gps_holdover":
+            if packet.get("timestampSource") == "gps_holdover" and not local_time.startswith("设备运行"):
                 return local_time + "（由最近 GPS 校时推算）"
             return local_time
         return f"设备运行 {int(packet.get('uptimeMs', 0)) / 1000:.1f} 秒（未校时）"
