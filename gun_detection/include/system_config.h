@@ -42,8 +42,8 @@ inline constexpr float VIBRATE_JERK_THRESHOLD_COUNTS = 120.0F;//候选冲击开�
 inline constexpr float VIBRATE_QUIET_THRESHOLD_COUNTS = 90.0F;
 // 低功耗状态检测使用 100 ms 三轴 ADC 窗口峰峰值；阈值需按实物噪声校准。
 inline constexpr uint32_t MOTION_WINDOW_US = 100000;
-inline constexpr uint16_t MOTION_STILL_AXIS_DELTA = 45;
-inline constexpr uint16_t MOTION_WAKE_AXIS_DELTA = 75;
+inline constexpr uint16_t MOTION_STILL_AXIS_DELTA = 100;  //45;
+inline constexpr uint16_t MOTION_WAKE_AXIS_DELTA = 150;  //75
 inline constexpr uint32_t LOW_POWER_STATIONARY_MS = 5000;
 inline constexpr uint32_t LOW_POWER_POLL_INTERVAL_US = 10000;
 inline constexpr uint8_t VIBRATE_TRIGGER_SAMPLES = 2;  //且随后需要达到连续触发样本数（默认 2）才生成事件
