@@ -389,9 +389,11 @@ class MonitorWindow(QMainWindow):
                 session_id TEXT NOT NULL,
                 sequence INTEGER NOT NULL,
                 uptime_ms INTEGER NOT NULL,
+                uptime_us INTEGER NOT NULL DEFAULT 0,
                 utc_date INTEGER NOT NULL,
                 utc_time_ms INTEGER NOT NULL,
                 timestamp_source TEXT NOT NULL DEFAULT 'uptime',
+                track_timestamp TEXT NOT NULL DEFAULT '',
                 latitude REAL NOT NULL,
                 longitude REAL NOT NULL,
                 hdop REAL NOT NULL,
@@ -411,6 +413,28 @@ class MonitorWindow(QMainWindow):
                 "UPDATE track_points SET timestamp_source = "
                 "CASE WHEN utc_date > 0 THEN 'gps' ELSE 'uptime' END"
             )
+        if "uptime_us" not in track_columns:
+            self.track_db.execute(
+                "ALTER TABLE track_points ADD COLUMN uptime_us INTEGER NOT NULL DEFAULT 0"
+            )
+        if "track_timestamp" not in track_columns:
+            self.track_db.execute(
+                "ALTER TABLE track_points ADD COLUMN track_timestamp TEXT NOT NULL DEFAULT ''"
+            )
+        self.track_db.execute(
+            "UPDATE track_points SET uptime_us = uptime_ms * 1000 WHERE uptime_us = 0"
+        )
+        old_track_points = self.track_db.execute(
+            """SELECT rowid, utc_date, utc_time_ms FROM track_points
+               WHERE track_timestamp = ''"""
+        ).fetchall()
+        for rowid, utc_date, utc_time_ms in old_track_points:
+            track_timestamp = self._track_iso_timestamp(utc_date, utc_time_ms)
+            if track_timestamp:
+                self.track_db.execute(
+                    "UPDATE track_points SET track_timestamp = ? WHERE rowid = ?",
+                    (track_timestamp, rowid),
+                )
         self.track_db.execute(
             """CREATE TABLE IF NOT EXISTS shot_events (
                 device_id TEXT NOT NULL,
@@ -543,18 +567,24 @@ class MonitorWindow(QMainWindow):
                 if previous_sequence is not None and sequence != previous_sequence + 1:
                     raise ValueError("批次内轨迹序号不连续")
                 previous_sequence = sequence
+                uptime_ms = int(point.get("uptimeMs", 0))
+                # 当前设备轨迹协议只发 uptimeMs；转换到微秒单位，但精度仍为 1 ms。
+                uptime_us = int(point.get("uptimeUs", uptime_ms * 1000))
+                utc_date = int(point.get("utcDate", 0))
+                utc_time_ms = int(point.get("utcTimeMs", 0))
                 rows.append((
-                    device_id, session_id, sequence, int(point.get("uptimeMs", 0)),
-                    int(point.get("utcDate", 0)), int(point.get("utcTimeMs", 0)),
+                    device_id, session_id, sequence, uptime_ms, uptime_us,
+                    utc_date, utc_time_ms,
                     str(point.get("timestampSource", "gps" if point.get("utcDate") else "uptime")),
+                    self._track_iso_timestamp(utc_date, utc_time_ms),
                     latitude, longitude, float(point.get("hdop", 0.0)),
                     int(point.get("satellites", 0)), received_at,
                 ))
             self.track_db.executemany(
                 """INSERT OR IGNORE INTO track_points
-                   (device_id, session_id, sequence, uptime_ms, utc_date, utc_time_ms,
-                    timestamp_source, latitude, longitude, hdop, satellites, received_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (device_id, session_id, sequence, uptime_ms, uptime_us, utc_date, utc_time_ms,
+                    timestamp_source, track_timestamp, latitude, longitude, hdop, satellites, received_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 rows,
             )
             self.track_db.commit()
@@ -650,22 +680,44 @@ class MonitorWindow(QMainWindow):
                 pass
         return f"设备运行 {uptime_ms / 1000:.1f} 秒"
 
+    @staticmethod
+    def _track_iso_timestamp(utc_date, utc_time_ms):
+        """将设备 UTC 日期和当天毫秒转换为 ISO 8601 UTC 时间。"""
+        try:
+            date_value = int(utc_date)
+            milliseconds = int(utc_time_ms)
+            if date_value < 20200101 or not 0 <= milliseconds < 86400000:
+                return ""
+            date_text = f"{date_value:08d}"
+            hour, milliseconds = divmod(milliseconds, 3600000)
+            minute, milliseconds = divmod(milliseconds, 60000)
+            second, milliseconds = divmod(milliseconds, 1000)
+            utc_datetime = datetime.strptime(
+                f"{date_text} {hour:02d}:{minute:02d}:{second:02d}.{milliseconds:03d}",
+                "%Y%m%d %H:%M:%S.%f",
+            ).replace(tzinfo=timezone.utc)
+            return utc_datetime.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        except (TypeError, ValueError, OverflowError):
+            return ""
+
     def _selected_track_points(self):
         key = self.track_combo.currentData()
         if not key:
             return None, []
         device_id, session_id = key
         rows = self.track_db.execute(
-            """SELECT sequence, uptime_ms, utc_date, utc_time_ms, timestamp_source, latitude, longitude,
-                      hdop, satellites
+            """SELECT sequence, uptime_ms, uptime_us, utc_date, utc_time_ms, timestamp_source,
+                      track_timestamp, latitude, longitude, hdop, satellites, received_at
                FROM track_points
                WHERE device_id=? AND session_id=? ORDER BY sequence""",
             (device_id, session_id),
         ).fetchall()
         points = [{
-            "seq": row[0], "uptimeMs": row[1],
-            "timestamp": self._track_timestamp(row[2], row[3], row[1], row[4]),
-            "lat": row[5], "lon": row[6], "hdop": row[7], "satellites": row[8],
+            "seq": row[0], "uptimeMs": row[1], "uptimeUs": row[2],
+            "timestamp": self._track_timestamp(row[3], row[4], row[1], row[5]),
+            "timestampIso": row[6], "timestampSource": row[5],
+            "lat": row[7], "lon": row[8], "hdop": row[9], "satellites": row[10],
+            "receivedAt": row[11],
         } for row in rows]
         return key, points
 
@@ -693,7 +745,21 @@ class MonitorWindow(QMainWindow):
         if key is None or not points:
             QMessageBox.information(self, "没有轨迹", "先接收至少一个轨迹点再导出。")
             return
-        default_name = f"track_{key[1]}.geojson"
+        start_time = None
+        try:
+            if points[0]["timestampIso"]:
+                start_time = datetime.fromisoformat(
+                    points[0]["timestampIso"].replace("Z", "+00:00")
+                ).astimezone()
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if start_time is None:
+            try:
+                start_time = datetime.fromisoformat(points[0]["receivedAt"]).astimezone()
+            except (TypeError, ValueError, OverflowError):
+                start_time = datetime.now()
+        start_text = start_time.strftime("%Y-%m-%d_%H%M%S")
+        default_name = f"track_{start_text}_{len(points)}.geojson"
         path, _ = QFileDialog.getSaveFileName(
             self, "导出轨迹", default_name, "GeoJSON 文件 (*.geojson *.json)"
         )
