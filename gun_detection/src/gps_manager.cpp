@@ -59,7 +59,10 @@ GpsFix GpsManager::currentFix() {
     if (gps_.satellites.isValid()) {
         fix.satellites = gps_.satellites.value();
     }
-    if (gps_.date.isValid() && gps_.time.isValid() &&
+    if (gps_.date.isValid() && gps_.time.isValid() && gps_.date.year() >= 2020 &&
+        gps_.date.month() >= 1 && gps_.date.month() <= 12 &&
+        gps_.date.day() >= 1 && gps_.date.day() <= 31 &&
+        gps_.time.hour() <= 23 && gps_.time.minute() <= 59 && gps_.time.second() <= 59 &&
         gps_.date.age() <= config::GPS_MAX_FIX_AGE_MS &&
         gps_.time.age() <= config::GPS_MAX_FIX_AGE_MS) {
         fix.utcAgeMs = max(gps_.date.age(), gps_.time.age());
@@ -70,6 +73,7 @@ GpsFix GpsManager::currentFix() {
                         static_cast<uint32_t>(gps_.time.second()) * 1000UL +
                         static_cast<uint32_t>(gps_.time.centisecond()) * 10UL;
         fix.utcValid = true;
+        fix.utcSource = UTC_SOURCE_GPS;
     }
     return fix;
 }

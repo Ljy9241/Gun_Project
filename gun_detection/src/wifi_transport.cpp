@@ -48,6 +48,7 @@ bool jsonUintField(const char* json, const char* key, uint32_t& value) {
     value = static_cast<uint32_t>(parsed);
     return true;
 }
+
 }  // namespace
 
 void WifiTransport::begin() {
@@ -165,10 +166,10 @@ void WifiTransport::receiveAcks(GpsTrackStore& trackStore, ShotEventStore& shotS
         }
         payload[length] = '\0';
         char type[32];
+        if (!jsonStringField(payload, "type", type, sizeof(type))) continue;
         char sessionId[17];
         uint32_t sequence = 0;
-        if (!jsonStringField(payload, "type", type, sizeof(type)) ||
-            !jsonStringField(payload, "sessionId", sessionId, sizeof(sessionId)) ||
+        if (!jsonStringField(payload, "sessionId", sessionId, sizeof(sessionId)) ||
             !jsonUintField(payload, "seq", sequence)) continue;
         if (strcmp(type, "track_ack") == 0 && trackStore.acknowledge(sessionId, sequence)) {
             lastTrackSendMs_ = 0;

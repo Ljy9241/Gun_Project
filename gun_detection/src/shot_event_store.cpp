@@ -92,7 +92,7 @@ bool ShotEventStore::record(const ShotEvent& event, uint32_t uptimeMs) {
         static_cast<unsigned long>(event.gps.valid ? event.gps.satellites : 0),
         static_cast<unsigned long>(event.gps.valid ? event.gps.ageMs : UINT32_MAX),
         static_cast<unsigned long>(utcDate), static_cast<unsigned long>(utcTimeMs),
-        event.gps.utcEstimated ? 1U : 0U);
+        static_cast<unsigned>(event.gps.utcSource));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line)) {
         ++droppedEvents_;
         return false;
@@ -134,7 +134,7 @@ bool ShotEventStore::peek(ShotUpload& upload) {
     unsigned long long timestampUs = 0;
     unsigned voiceP2P = 0, rawX = 0, rawY = 0, rawZ = 0, saturated = 0, gpsValid = 0;
     unsigned long satellites = 0, gpsAgeMs = UINT32_MAX, utcDate = 0, utcTimeMs = 0;
-    unsigned long utcEstimated = 0;
+    unsigned long utcSource = UTC_SOURCE_UPTIME;
     float voiceRms = 0, riseRatio = 0, accelPeak = 0, accelJerk = 0;
     float hdop = 0;
     double latitude = 0, longitude = 0;
@@ -146,7 +146,7 @@ bool ShotEventStore::peek(ShotUpload& upload) {
         &voiceRms, &riseRatio, &rawX, &rawY, &rawZ, &accelPeak, &accelJerk, &saturated,
         &gpsValid,
         &latitude, &longitude, &altitudeM, &speedKmph, &hdop, &satellites, &gpsAgeMs,
-        &utcDate, &utcTimeMs, &utcEstimated);
+        &utcDate, &utcTimeMs, &utcSource);
     if (parsed != 26 || sequence == 0) return false;
 
     memcpy(upload.sessionId, session, sizeof(upload.sessionId));
@@ -163,7 +163,7 @@ bool ShotEventStore::peek(ShotUpload& upload) {
         "\"latitude\":%.7f,\"longitude\":%.7f,\"altitudeM\":%.1f,"
         "\"speedKmph\":%.2f,\"hdop\":%.1f,\"satellites\":%lu,\"gpsAgeMs\":%lu}\r\n",
         config::DEVICE_ID, session, sequence, shotId, shotCount, uptimeMs, timestampUs,
-        !utcDate ? "uptime" : (utcEstimated ? "gps_holdover" : "gps"),
+        utcTimeSourceName(static_cast<uint8_t>(utcSource), utcDate != 0),
         utcDate, utcTimeMs, voiceP2P, voiceRms, riseRatio,
         rawX, rawY, rawZ, accelPeak, accelJerk, saturated ? "true" : "false",
         gpsValid ? "true" : "false",

@@ -3,6 +3,26 @@
 #include <Arduino.h>
 #include <TinyGPSPlus.h>
 
+// 时间戳来源写入轨迹和事件记录；0/1 延续旧版 GPS/holdover 编码。
+enum UtcTimeSource : uint8_t {
+    UTC_SOURCE_GPS = 0,
+    UTC_SOURCE_GPS_HOLDOVER = 1,
+    UTC_SOURCE_NTP = 2,
+    UTC_SOURCE_NTP_HOLDOVER = 3,
+    UTC_SOURCE_UPTIME = 4,
+};
+
+inline const char* utcTimeSourceName(uint8_t source, bool hasUtc) {
+    if (!hasUtc) return "uptime";
+    switch (source) {
+        case UTC_SOURCE_GPS: return "gps";
+        case UTC_SOURCE_GPS_HOLDOVER: return "gps_holdover";
+        case UTC_SOURCE_NTP: return "ntp";
+        case UTC_SOURCE_NTP_HOLDOVER: return "ntp_holdover";
+        default: return "uptime";
+    }
+}
+
 // 一次 GPS 定位快照；valid 同时考虑定位有效性和数据新鲜度。
 struct GpsFix {
     bool valid = false;
@@ -17,7 +37,7 @@ struct GpsFix {
     uint32_t utcTimeMs = 0;  // 当天 UTC 毫秒数。
     uint32_t utcAgeMs = UINT32_MAX;
     bool utcValid = false;
-    bool utcEstimated = false;
+    uint8_t utcSource = UTC_SOURCE_UPTIME;
 };
 
 class GpsManager {

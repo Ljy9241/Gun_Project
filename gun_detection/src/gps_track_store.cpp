@@ -123,20 +123,22 @@ bool GpsTrackStore::recordFix(const GpsFix& fix, uint32_t uptimeMs, bool newLoca
     point.uptimeMs = uptimeMs;
     point.utcDate = fix.utcValid ? fix.utcDate : 0;
     point.utcTimeMs = fix.utcValid ? fix.utcTimeMs : 0;
+    point.utcSource = fix.utcValid ? fix.utcSource : UTC_SOURCE_UPTIME;
     point.latitude = fix.latitude;
     point.longitude = fix.longitude;
     point.hdop = static_cast<float>(fix.hdop);
     point.satellites = fix.satellites;
 
     char line[192];
-    const int length = snprintf(line, sizeof(line), "%s,%lu,%lu,%lu,%lu,%.7f,%.7f,%.2f,%lu\n",
+    const int length = snprintf(line, sizeof(line), "%s,%lu,%lu,%lu,%lu,%.7f,%.7f,%.2f,%lu,%u\n",
                                 point.sessionId,
                                 static_cast<unsigned long>(point.sequence),
                                 static_cast<unsigned long>(point.uptimeMs),
                                 static_cast<unsigned long>(point.utcDate),
                                 static_cast<unsigned long>(point.utcTimeMs),
                                 point.latitude, point.longitude, point.hdop,
-                                static_cast<unsigned long>(point.satellites));
+                                static_cast<unsigned long>(point.satellites),
+                                static_cast<unsigned>(point.utcSource));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line)) {
         ++droppedPoints_;
         return false;
@@ -213,12 +215,15 @@ bool GpsTrackStore::peekBatch(TrackBatch& batch) {
         written = snprintf(
             batch.payload + used, sizeof(batch.payload) - used,
             "%s{\"seq\":%lu,\"uptimeMs\":%lu,\"utcDate\":%lu,\"utcTimeMs\":%lu,"
+            "\"timestampSource\":\"%s\","
             "\"lat\":%.7f,\"lon\":%.7f,\"hdop\":%.2f,\"satellites\":%lu}",
             batch.pointCount == 0 ? "" : ",",
             static_cast<unsigned long>(point.sequence),
             static_cast<unsigned long>(point.uptimeMs),
             static_cast<unsigned long>(point.utcDate),
-            static_cast<unsigned long>(point.utcTimeMs), point.latitude, point.longitude,
+            static_cast<unsigned long>(point.utcTimeMs),
+            utcTimeSourceName(point.utcSource, point.utcDate != 0),
+            point.latitude, point.longitude,
             point.hdop, static_cast<unsigned long>(point.satellites));
         if (written <= 0 || static_cast<size_t>(written) >= sizeof(batch.payload) - used) {
             log.close();
@@ -278,16 +283,19 @@ bool GpsTrackStore::parseLine(const String& line, TrackPoint& point) const {
     unsigned long utcDate = 0;
     unsigned long utcTimeMs = 0;
     unsigned long satellites = 0;
-    int parsed = sscanf(line.c_str(), "%16[^,],%lu,%lu,%lu,%lu,%lf,%lf,%f,%lu",
+    unsigned source = UTC_SOURCE_UPTIME;
+    int parsed = sscanf(line.c_str(), "%16[^,],%lu,%lu,%lu,%lu,%lf,%lf,%f,%lu,%u",
                         point.sessionId, &sequence, &uptime, &utcDate, &utcTimeMs,
-                        &point.latitude, &point.longitude, &point.hdop, &satellites);
-    if (parsed != 9) {
+                        &point.latitude, &point.longitude, &point.hdop, &satellites, &source);
+    if (parsed != 9 && parsed != 10) {
         return false;
     }
     point.sequence = static_cast<uint32_t>(sequence);
     point.uptimeMs = static_cast<uint32_t>(uptime);
     point.utcDate = static_cast<uint32_t>(utcDate);
     point.utcTimeMs = static_cast<uint32_t>(utcTimeMs);
+    point.utcSource = parsed == 10 ? static_cast<uint8_t>(source)
+                                   : (point.utcDate ? UTC_SOURCE_GPS : UTC_SOURCE_UPTIME);
     point.satellites = static_cast<uint32_t>(satellites);
     return true;
 }

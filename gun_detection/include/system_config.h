@@ -59,6 +59,11 @@ inline constexpr char WIFI_PASSWORD[] = "zxcvbnm1";
 // 此处填写电脑无线网卡的 IPv4 地址，不要填写手机热点网关地址。
 inline constexpr char UPPER_COMPUTER_HOST[] = "10.126.104.83";
 inline constexpr uint16_t UPPER_COMPUTER_PORT = 8888;
+// ESP32 连入互联网后通过 SNTP 校准 UTC 时间；按 UTC 配置，不在设备端做时区偏移。
+inline constexpr char NTP_SERVER_1[] = "pool.ntp.org";
+inline constexpr char NTP_SERVER_2[] = "time.cloudflare.com";
+inline constexpr char NTP_SERVER_3[] = "time.google.com";
+inline constexpr uint32_t NTP_CLOCK_REFRESH_INTERVAL_MS = 60000;
 inline constexpr char DEVICE_ID[] = "gun_dection";
 inline constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;      //Wi-Fi 重新连接的时间间隔
 inline constexpr uint32_t UDP_STATUS_INTERVAL_MS = 50;          // UDP 状态包发送的时间间隔

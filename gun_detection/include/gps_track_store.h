@@ -10,6 +10,7 @@ struct TrackPoint {
     uint32_t uptimeMs = 0;
     uint32_t utcDate = 0;
     uint32_t utcTimeMs = 0;
+    uint8_t utcSource = UTC_SOURCE_UPTIME;
     double latitude = 0.0;
     double longitude = 0.0;
     float hdop = 0.0F;
