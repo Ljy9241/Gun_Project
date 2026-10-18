@@ -206,8 +206,19 @@ class MonitorWindow(QMainWindow):
         self.start_uptime = None
         self.last_packet_time = None
         self.shot_count = 0
-        self.track_db_path = Path.home() / ".gun_wifi_monitor" / "tracks.sqlite3"
-        self.track_db_path.parent.mkdir(parents=True, exist_ok=True)
+        database_dir = Path.home() / ".gun_wifi_monitor"
+        database_dir.mkdir(parents=True, exist_ok=True)
+        legacy_db_path = database_dir / "tracks.sqlite3"
+        self.track_db_path = database_dir / "gun_detection_monitor.sqlite3"
+        # 只在新文件尚不存在时，从旧库做 SQLite 在线备份，保留原库作为回退副本。
+        if not self.track_db_path.exists() and legacy_db_path.exists():
+            legacy_db = sqlite3.connect(legacy_db_path)
+            new_db = sqlite3.connect(self.track_db_path)
+            try:
+                legacy_db.backup(new_db)
+            finally:
+                new_db.close()
+                legacy_db.close()
         self.track_db = sqlite3.connect(self.track_db_path)
         self._init_track_database()
         self._build_ui()
@@ -390,10 +401,10 @@ class MonitorWindow(QMainWindow):
                 sequence INTEGER NOT NULL,
                 uptime_ms INTEGER NOT NULL,
                 uptime_us INTEGER NOT NULL DEFAULT 0,
+                track_timestamp TEXT NOT NULL DEFAULT '',
+                timestamp_source TEXT NOT NULL DEFAULT 'uptime',
                 utc_date INTEGER NOT NULL,
                 utc_time_ms INTEGER NOT NULL,
-                timestamp_source TEXT NOT NULL DEFAULT 'uptime',
-                track_timestamp TEXT NOT NULL DEFAULT '',
                 latitude REAL NOT NULL,
                 longitude REAL NOT NULL,
                 hdop REAL NOT NULL,
@@ -444,6 +455,7 @@ class MonitorWindow(QMainWindow):
                 shot_count INTEGER NOT NULL,
                 uptime_ms INTEGER NOT NULL,
                 uptime_us INTEGER NOT NULL,
+                event_timestamp TEXT NOT NULL,
                 timestamp_source TEXT NOT NULL,
                 utc_date INTEGER NOT NULL,
                 utc_time_ms INTEGER NOT NULL,
@@ -464,7 +476,6 @@ class MonitorWindow(QMainWindow):
                 hdop REAL NOT NULL,
                 satellites INTEGER NOT NULL,
                 gps_age_ms INTEGER NOT NULL,
-                event_timestamp TEXT NOT NULL,
                 received_at TEXT NOT NULL,
                 PRIMARY KEY (device_id, session_id, sequence)
             )"""
@@ -495,7 +506,102 @@ class MonitorWindow(QMainWindow):
                 "UPDATE shot_events SET event_timestamp = ? WHERE rowid = ?",
                 (event_timestamp, rowid),
             )
+
+        self._reorder_table_columns(
+            "track_points",
+            [
+                "device_id", "session_id", "sequence", "uptime_ms", "uptime_us",
+                "track_timestamp", "timestamp_source", "utc_date", "utc_time_ms",
+                "latitude", "longitude", "hdop", "satellites", "received_at",
+            ],
+            """CREATE TABLE {table} (
+                device_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                uptime_ms INTEGER NOT NULL,
+                uptime_us INTEGER NOT NULL DEFAULT 0,
+                track_timestamp TEXT NOT NULL DEFAULT '',
+                timestamp_source TEXT NOT NULL DEFAULT 'uptime',
+                utc_date INTEGER NOT NULL,
+                utc_time_ms INTEGER NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                hdop REAL NOT NULL,
+                satellites INTEGER NOT NULL,
+                received_at TEXT NOT NULL,
+                PRIMARY KEY (device_id, session_id, sequence)
+            )""",
+        )
+        self._reorder_table_columns(
+            "shot_events",
+            [
+                "device_id", "session_id", "sequence", "shot_id", "shot_count",
+                "uptime_ms", "uptime_us", "event_timestamp", "timestamp_source",
+                "utc_date", "utc_time_ms", "voice_p2p", "voice_rms", "voice_rise_ratio",
+                "accel_x", "accel_y", "accel_z", "accel_peak", "accel_jerk",
+                "accel_saturated", "gps_valid", "latitude", "longitude", "altitude_m",
+                "speed_kmph", "hdop", "satellites", "gps_age_ms", "received_at",
+            ],
+            """CREATE TABLE {table} (
+                device_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                shot_id INTEGER NOT NULL,
+                shot_count INTEGER NOT NULL,
+                uptime_ms INTEGER NOT NULL,
+                uptime_us INTEGER NOT NULL,
+                event_timestamp TEXT NOT NULL,
+                timestamp_source TEXT NOT NULL,
+                utc_date INTEGER NOT NULL,
+                utc_time_ms INTEGER NOT NULL,
+                voice_p2p INTEGER NOT NULL,
+                voice_rms REAL NOT NULL,
+                voice_rise_ratio REAL NOT NULL,
+                accel_x INTEGER NOT NULL,
+                accel_y INTEGER NOT NULL,
+                accel_z INTEGER NOT NULL,
+                accel_peak REAL NOT NULL,
+                accel_jerk REAL NOT NULL,
+                accel_saturated INTEGER NOT NULL,
+                gps_valid INTEGER NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                altitude_m REAL NOT NULL,
+                speed_kmph REAL NOT NULL,
+                hdop REAL NOT NULL,
+                satellites INTEGER NOT NULL,
+                gps_age_ms INTEGER NOT NULL,
+                received_at TEXT NOT NULL,
+                PRIMARY KEY (device_id, session_id, sequence)
+            )""",
+        )
         self.track_db.commit()
+
+    def _reorder_table_columns(self, table_name, desired_columns, create_sql):
+        """仅在列集合一致时重建表结构顺序，避免迁移时丢失未知旧字段。"""
+        current_columns = [
+            row[1] for row in self.track_db.execute(f"PRAGMA table_info({table_name})")
+        ]
+        if current_columns == desired_columns or set(current_columns) != set(desired_columns):
+            return
+
+        old_table = f"{table_name}_before_column_reorder"
+        savepoint = f"reorder_{table_name}"
+        column_sql = ", ".join(desired_columns)
+        self.track_db.execute(f"SAVEPOINT {savepoint}")
+        try:
+            self.track_db.execute(f"ALTER TABLE {table_name} RENAME TO {old_table}")
+            self.track_db.execute(create_sql.format(table=table_name))
+            self.track_db.execute(
+                f"INSERT INTO {table_name} ({column_sql}) "
+                f"SELECT {column_sql} FROM {old_table}"
+            )
+            self.track_db.execute(f"DROP TABLE {old_table}")
+            self.track_db.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except sqlite3.Error:
+            self.track_db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self.track_db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
 
     def _position_legend(self):
         """将轴颜色图例固定在绘图区域右上角。"""
