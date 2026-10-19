@@ -1,6 +1,9 @@
 #pragma once
 
 #include <Arduino.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // 振动触发事件，记录触发时三轴 ADC 值和本次冲击的峰值特征。
 struct VibrateEvent {
@@ -16,7 +19,8 @@ struct VibrateEvent {
 class VibrateDetection {
 public:
     // 配置三轴 ADC 输入和传感器休眠控制脚。
-    void begin(uint8_t xPin, uint8_t yPin, uint8_t zPin, uint8_t sleepPin);
+    bool begin(uint8_t xPin, uint8_t yPin, uint8_t zPin, uint8_t sleepPin);
+    bool startSamplingTask();
     void update(uint64_t nowUs);
     bool consumeEvent(VibrateEvent& event);  // 取走单个待处理事件。
     bool stationaryForLowPower() const;
@@ -24,16 +28,20 @@ public:
     void setSampleIntervalUs(uint32_t intervalUs);
     void clearPendingEvent();
 
-    bool flag() const { return eventPending_; }
-    bool calibrated() const { return calibrated_; }
-    uint16_t rawX() const { return rawX_; }
-    uint16_t rawY() const { return rawY_; }
-    uint16_t rawZ() const { return rawZ_; }
-    float magnitude() const { return magnitude_; }
-    float jerk() const { return jerk_; }
-    uint32_t droppedSamples() const { return droppedSamples_; }
+    bool flag() const;
+    bool calibrated() const;
+    uint16_t rawX() const;
+    uint16_t rawY() const;
+    uint16_t rawZ() const;
+    float magnitude() const;
+    float jerk() const;
+    uint32_t droppedSamples() const;
 
 private:
+    static void samplingTask(void* argument);
+    static void samplingTimerCallback(void* argument);
+    void updateLocked(uint64_t nowUs);
+
     uint8_t xPin_ = 0;
     uint8_t yPin_ = 0;
     uint8_t zPin_ = 0;
@@ -71,6 +79,11 @@ private:
     uint16_t motionMaxY_ = 0;
     uint16_t motionMaxZ_ = 0;
     uint32_t stationaryDurationMs_ = 0;
+    SemaphoreHandle_t mutex_ = nullptr;
+    TaskHandle_t samplingTaskHandle_ = nullptr;
+    esp_timer_handle_t samplingTimer_ = nullptr;
+    uint32_t timerIntervalUs_ = 0;
+    bool samplingTaskStarted_ = false;
     uint8_t wakeWindows_ = 0;
     uint8_t weakMotionWindows_ = 0;
     bool movementPending_ = false;

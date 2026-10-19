@@ -24,6 +24,8 @@ ShotEventStore shotEventStore;
 
 uint32_t lastDiagnosticMs = 0;
 bool lowPowerMode = false;
+bool vibrationDetectionInitialized = false;
+bool vibrationSamplingTaskStarted = false;
 bool deviceClockSynchronized = false;
 uint32_t clockBaseDate = 0;
 uint32_t clockBaseTimeMs = 0;
@@ -131,8 +133,15 @@ void setup() {
 
     analogReadResolution(12);
     voiceDetection.begin(config::MIC_ADC_PIN);
-    vibrateDetection.begin(config::MMA_X_PIN, config::MMA_Y_PIN, config::MMA_Z_PIN,
-                            config::MMA_SLEEP_PIN);
+    vibrationDetectionInitialized = vibrateDetection.begin(
+        config::MMA_X_PIN, config::MMA_Y_PIN, config::MMA_Z_PIN, config::MMA_SLEEP_PIN);
+    vibrationSamplingTaskStarted =
+        vibrationDetectionInitialized && vibrateDetection.startSamplingTask();
+    if (!vibrationDetectionInitialized) {
+        Serial.println("MMA7361 detection initialization failed.");
+    } else if (!vibrationSamplingTaskStarted) {
+        Serial.println("MMA7361 sampling task creation failed; using main-loop fallback.");
+    }
     gps.begin(config::GPS_ENABLE_PIN, config::GPS_PPS_PIN, config::GPS_UART_RX_PIN,
               config::GPS_UART_TX_PIN, config::GPS_BAUD);
     gpsTrackStore.begin();
@@ -147,7 +156,10 @@ void loop() {
     const uint64_t nowUs = esp_timer_get_time();
     const uint32_t nowMs = millis();
 
-    vibrateDetection.update(nowUs);
+    // 正常情况下由独立 FreeRTOS 任务采样；任务创建失败时退回主循环采样。
+    if (vibrationDetectionInitialized && !vibrationSamplingTaskStarted) {
+        vibrateDetection.update(nowUs);
+    }
     const bool movementDetected = vibrateDetection.consumeMovement();
     if (lowPowerMode && movementDetected) {
         lowPowerMode = false;

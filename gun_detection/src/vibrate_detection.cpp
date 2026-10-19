@@ -2,10 +2,36 @@
 
 #include <math.h>
 #include <esp_timer.h>
+#include <freertos/task.h>
 
 #include "system_config.h"
 
-void VibrateDetection::begin(uint8_t xPin, uint8_t yPin, uint8_t zPin, uint8_t sleepPin) {
+namespace {
+class SemaphoreGuard {
+public:
+    explicit SemaphoreGuard(SemaphoreHandle_t semaphore) : semaphore_(semaphore) {
+        locked_ = semaphore_ != nullptr && xSemaphoreTake(semaphore_, portMAX_DELAY) == pdTRUE;
+    }
+
+    ~SemaphoreGuard() {
+        if (locked_) xSemaphoreGive(semaphore_);
+    }
+
+    explicit operator bool() const { return locked_; }
+
+private:
+    SemaphoreHandle_t semaphore_;
+    bool locked_ = false;
+};
+}  // namespace
+
+bool VibrateDetection::begin(uint8_t xPin, uint8_t yPin, uint8_t zPin, uint8_t sleepPin) {
+    mutex_ = xSemaphoreCreateMutex();
+    if (mutex_ == nullptr) {
+        Serial.println("MMA7361 sampling mutex creation failed.");
+        return false;
+    }
+
     xPin_ = xPin;
     yPin_ = yPin;
     zPin_ = zPin;
@@ -23,9 +49,77 @@ void VibrateDetection::begin(uint8_t xPin, uint8_t yPin, uint8_t zPin, uint8_t s
     sampleIntervalUs_ = 1000000UL / config::VIBRATE_SAMPLE_RATE_HZ;
     nextSampleUs_ = static_cast<uint64_t>(esp_timer_get_time()) + 1000;
     motionWindowStartUs_ = nextSampleUs_;
+    return true;
+}
+
+bool VibrateDetection::startSamplingTask() {
+    if (mutex_ == nullptr || samplingTaskStarted_) return false;
+    const BaseType_t created = xTaskCreate(
+        samplingTask, "mma7361_sampler", 4096, this, tskIDLE_PRIORITY + 2,
+        &samplingTaskHandle_);
+    if (created != pdPASS) return false;
+
+    esp_timer_create_args_t timerArgs = {};
+    timerArgs.callback = &VibrateDetection::samplingTimerCallback;
+    timerArgs.arg = this;
+    timerArgs.dispatch_method = ESP_TIMER_TASK;
+    timerArgs.name = "mma_sample_tick";
+    if (esp_timer_create(&timerArgs, &samplingTimer_) != ESP_OK) {
+        vTaskDelete(samplingTaskHandle_);
+        samplingTaskHandle_ = nullptr;
+        return false;
+    }
+
+    timerIntervalUs_ = sampleIntervalUs_;
+    if (esp_timer_start_periodic(samplingTimer_, timerIntervalUs_) != ESP_OK) {
+        esp_timer_delete(samplingTimer_);
+        samplingTimer_ = nullptr;
+        vTaskDelete(samplingTaskHandle_);
+        samplingTaskHandle_ = nullptr;
+        return false;
+    }
+
+    samplingTaskStarted_ = true;
+    return true;
+}
+
+void VibrateDetection::samplingTask(void* argument) {
+    auto* self = static_cast<VibrateDetection*>(argument);
+    for (;;) {
+        // 高精度定时器只通知任务；ADC 读取和计算都在普通 FreeRTOS 任务上下文完成。
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        self->update(esp_timer_get_time());
+
+        uint32_t intervalUs = 1000;
+        {
+            SemaphoreGuard lock(self->mutex_);
+            if (lock) intervalUs = self->sampleIntervalUs_;
+        }
+        if (intervalUs != self->timerIntervalUs_) {
+            esp_timer_stop(self->samplingTimer_);
+            if (esp_timer_start_periodic(self->samplingTimer_, intervalUs) == ESP_OK) {
+                self->timerIntervalUs_ = intervalUs;
+            } else {
+                Serial.println("MMA7361 sampling timer restart failed.");
+            }
+        }
+    }
+}
+
+void VibrateDetection::samplingTimerCallback(void* argument) {
+    auto* self = static_cast<VibrateDetection*>(argument);
+    if (self->samplingTaskHandle_ != nullptr) {
+        xTaskNotifyGive(self->samplingTaskHandle_);
+    }
 }
 
 void VibrateDetection::update(uint64_t nowUs) {
+    SemaphoreGuard lock(mutex_);
+    if (!lock) return;
+    updateLocked(nowUs);
+}
+
+void VibrateDetection::updateLocked(uint64_t nowUs) {
     if (nowUs < nextSampleUs_) {
         return;
     }
@@ -61,22 +155,22 @@ void VibrateDetection::update(uint64_t nowUs) {
             if (stationaryDurationMs_ > config::LOW_POWER_STATIONARY_MS) {
                 stationaryDurationMs_ = config::LOW_POWER_STATIONARY_MS;
             }
-            wakeWindows_ = 0;
-            weakMotionWindows_ = 0;
         } else {
             stationaryDurationMs_ = 0;
-            if (largestDelta >= config::MOTION_WAKE_AXIS_DELTA) {
-                weakMotionWindows_ = 0;
-                if (wakeWindows_ < 2) ++wakeWindows_;
-                if (wakeWindows_ >= 2) movementPending_ = true;
-            } else if (largestDelta > config::MOTION_STILL_AXIS_DELTA) {
-                wakeWindows_ = 0;
-                if (weakMotionWindows_ < 5) ++weakMotionWindows_;
-                if (weakMotionWindows_ >= 5) movementPending_ = true;
-            } else {
-                wakeWindows_ = 0;
-                weakMotionWindows_ = 0;
-            }
+        }
+
+        // 唤醒灵敏度独立于静止门限判断；轻微移动也能唤醒，但需要连续窗口确认。
+        if (largestDelta >= config::MOTION_WAKE_AXIS_DELTA) {
+            weakMotionWindows_ = 0;
+            if (wakeWindows_ < 2) ++wakeWindows_;
+            if (wakeWindows_ >= 2) movementPending_ = true;
+        } else if (largestDelta >= config::MOTION_WEAK_WAKE_AXIS_DELTA) {
+            wakeWindows_ = 0;
+            if (weakMotionWindows_ < 2) ++weakMotionWindows_;
+            if (weakMotionWindows_ >= 2) movementPending_ = true;
+        } else {
+            wakeWindows_ = 0;
+            weakMotionWindows_ = 0;
         }
 
         motionWindowStartUs_ = nowUs;
@@ -147,6 +241,8 @@ void VibrateDetection::update(uint64_t nowUs) {
 }
 
 bool VibrateDetection::consumeEvent(VibrateEvent& event) {
+    SemaphoreGuard lock(mutex_);
+    if (!lock) return false;
     if (!eventPending_) {
         return false;
     }
@@ -156,12 +252,16 @@ bool VibrateDetection::consumeEvent(VibrateEvent& event) {
 }
 
 bool VibrateDetection::consumeMovement() {
+    SemaphoreGuard lock(mutex_);
+    if (!lock) return false;
     const bool detected = movementPending_;
     movementPending_ = false;
     return detected;
 }
 
 void VibrateDetection::clearPendingEvent() {
+    SemaphoreGuard lock(mutex_);
+    if (!lock) return;
     eventPending_ = false;
     consecutiveTriggerSamples_ = 0;
     candidatePeakMagnitude_ = 0.0F;
@@ -170,10 +270,14 @@ void VibrateDetection::clearPendingEvent() {
 }
 
 bool VibrateDetection::stationaryForLowPower() const {
+    SemaphoreGuard lock(mutex_);
+    if (!lock) return false;
     return calibrated_ && stationaryDurationMs_ >= config::LOW_POWER_STATIONARY_MS;
 }
 
 void VibrateDetection::setSampleIntervalUs(uint32_t intervalUs) {
+    SemaphoreGuard lock(mutex_);
+    if (!lock) return;
     if (intervalUs == 0 || intervalUs == sampleIntervalUs_) return;
     sampleIntervalUs_ = intervalUs;
     nextSampleUs_ = static_cast<uint64_t>(esp_timer_get_time());
@@ -183,4 +287,44 @@ void VibrateDetection::setSampleIntervalUs(uint32_t intervalUs) {
     stationaryDurationMs_ = 0;
     wakeWindows_ = 0;
     weakMotionWindows_ = 0;
+}
+
+bool VibrateDetection::flag() const {
+    SemaphoreGuard lock(mutex_);
+    return lock && eventPending_;
+}
+
+bool VibrateDetection::calibrated() const {
+    SemaphoreGuard lock(mutex_);
+    return lock && calibrated_;
+}
+
+uint16_t VibrateDetection::rawX() const {
+    SemaphoreGuard lock(mutex_);
+    return lock ? rawX_ : 0;
+}
+
+uint16_t VibrateDetection::rawY() const {
+    SemaphoreGuard lock(mutex_);
+    return lock ? rawY_ : 0;
+}
+
+uint16_t VibrateDetection::rawZ() const {
+    SemaphoreGuard lock(mutex_);
+    return lock ? rawZ_ : 0;
+}
+
+float VibrateDetection::magnitude() const {
+    SemaphoreGuard lock(mutex_);
+    return lock ? magnitude_ : 0.0F;
+}
+
+float VibrateDetection::jerk() const {
+    SemaphoreGuard lock(mutex_);
+    return lock ? jerk_ : 0.0F;
+}
+
+uint32_t VibrateDetection::droppedSamples() const {
+    SemaphoreGuard lock(mutex_);
+    return lock ? droppedSamples_ : 0;
 }
